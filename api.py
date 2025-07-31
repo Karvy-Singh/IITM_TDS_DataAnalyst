@@ -20,7 +20,9 @@ PLANNER_SYSTEM = """
 You are a master data-analysis planner. I will give you a user's request and any attachments or URLs.
 Produce a JSON plan with keys:
 - steps: an ordered list of {name, goal, inputs, outputs, needs_code (bool)}
+- requirements: (IF APPLICABLE) a list of pip‐installable package names/libraries your code will need 
 - final_outputs: list of names of variables for the final report
+- respone_type: expected structure of answer/reponse to EXTRACTED from the question itself. (e.g. json,yaml,db etc.)
 Only emit valid JSON.
 """
 
@@ -30,23 +32,26 @@ You are a reliable code generator.
 Rules:
 - Write ONLY Python code (no prose, no comments, no print/logging).
 - Assign EXACTLY the requested output variable names. Do not rename or add others.
+- use full library/package name do not use short forms like pandas as pd etc.
 - Do not read/write local files unless explicitly requested; fetch via provided helpers.
 - Be robust:
-  - When scraping HTML, handle missing nodes.
-  - When parsing numbers or currency, use `.astype(str).str.replace(r"[^\\d\\.]", "", regex=True)` then `pd.to_numeric(..., errors="coerce")`.
-  - Handle empty/NaN rows sensibly.
+    - example:
+      - When scraping HTML, handle missing nodes.
+      - Handle empty/NaN rows sensibly.
+    - Do whatever sensible data cleaning is required to achieve proper results.
 - If a library may be missing, prefer pure-Python or built-in alternatives when feasible.
 """
 
-
 INTERPRETER_SYSTEM = """
-You are a data-analysis interpreter. Given the original user request, the plan, and the final variables,
-write a clear, structured report:
+You are a data-analysis interpreter. Given the original user request, the plan, and the final output variables, produce a response.
+
+If the plan includes a 'response_type', return the result in that format — structured accordingly (e.g., dict, JSON, YAML, database row, etc. — depending on the specified type). Do not default to Markdown in this case.
+
+If no response_type is specified, return a Markdown report with the following structure:
 1. Summary of what was done
 2. Key findings (tables, charts, numbers)
 3. Conclusions or next steps
 4. Caveats if any
-Respond in Markdown.
 """
 
 # -------------------- Helpers --------------------
@@ -94,6 +99,16 @@ def normalize_outputs(outputs):
 
 # -------------------- Core Execution --------------------
 def execute_plan(plan: dict) -> dict:
+    import sys
+    import subprocess
+    # 1) install any extra requirements the planner specified
+    for pkg in plan.get("requirements", []):
+        try:
+            __import__(pkg)
+        except ImportError:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+    # 2) execution environment
     env = {"fetch_text": lambda url: requests.get(url, timeout=30).text}
     for step in plan.get("steps", []):
         if not step.get("needs_code", True):
@@ -107,7 +122,7 @@ def execute_plan(plan: dict) -> dict:
             f"OUTPUTS: {outputs}\n"
         )
         last_error = None
-        max_retries = 3
+        max_retries = 5
         for attempt in range(1, max_retries+1):
             # If error on previous attempt, ask to fix
             prompt = prompt_base
@@ -119,30 +134,31 @@ def execute_plan(plan: dict) -> dict:
             with tempfile.NamedTemporaryFile(mode="w+", suffix=".py", delete=False) as tmp:
                 tmp.write(textwrap.dedent("""
                     import json, datetime, base64
-                    try:
-                        import pandas as pd
-                    except ImportError:
-                        pd = None
-                    try:
-                        import numpy as np
-                    except ImportError:
-                        np = None
+                    # any imports your generated code needs should be included in the code itself
                     def _json_safe(x, _depth=0):
                         if _depth>5: return str(type(x).__name__)
                         if x is None or isinstance(x,(bool,int,float,str)): return x
-                        if pd is not None and isinstance(x, pd.DataFrame): return x.to_dict(orient='records')
-                        if pd is not None and isinstance(x, pd.Series): return x.tolist()
+                        try:
+                            # DataFrame/Series support if pandas was imported by user code
+                            import pandas as _pd
+                            if isinstance(x, _pd.DataFrame): return x.to_dict(orient='records')
+                            if isinstance(x, _pd.Series): return x.tolist()
+                        except ImportError:
+                            pass
+                        try:
+                            import numpy as _np
+                            if isinstance(x, _np.generic): return x.item()
+                            if isinstance(x, _np.ndarray): return x.tolist()
+                        except ImportError:
+                            pass
                         if isinstance(x, (datetime.datetime, datetime.date)): return x.isoformat()
-                        if np is not None and isinstance(x, np.generic): return x.item()
-                        if np is not None and isinstance(x, np.ndarray): return x.tolist()
                         if isinstance(x,(list,tuple,set)):
                             return [_json_safe(v,_depth+1) for v in x]
                         if isinstance(x, dict):
                             return {str(k): _json_safe(v,_depth+1) for k,v in x.items()}
                         try: json.dumps(x); return x
                         except: return str(x)
-                """))
-                # preload simple env
+                        """))                # preload simple env
                 for var,val in env.items():
                     if isinstance(val,(str,int,float,bool,list,dict)):
                         tmp.write(f"{var} = {json.dumps(val)}\n")
