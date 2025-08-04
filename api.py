@@ -6,9 +6,12 @@ import subprocess
 import re
 import textwrap
 import base64
+from typing import List, Optional
+
 from openai import OpenAI
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field, ValidationError
 
 # -------------------- OpenAI Client Configuration --------------------
 API_KEY = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjI0ZjIwMDExMjdAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.Y74CCboue-31JAlwbwCpT-AFlYvinglf636FmsfmLTE"
@@ -70,12 +73,31 @@ _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*([\s\S]*?)```", re.IGNORECASE)
 RESULT_START = "<<RESULT_JSON_START>>"
 RESULT_END   = "<<RESULT_JSON_END>>"
 
+class StepModel(BaseModel):
+    name: str = ""
+    goal: str = ""
+    inputs: List[str] = Field(default_factory=list)
+    outputs: List[str] = Field(default_factory=list)
+    needs_code: bool = True
+
+
+class PlanModel(BaseModel):
+    steps: List[StepModel] = Field(default_factory=list)
+    requirements: List[str] = Field(default_factory=list)
+    final_outputs: List[str] = Field(default_factory=list)
+    response_type: Optional[str] = None
+
+
 def generate_plan(user_text: str) -> dict:
     plan_json = call_llm(PLANNER_SYSTEM, user_text)
     try:
-        return json.loads(plan_json)
-    except json.JSONDecodeError as e:
+        try:
+            plan = PlanModel.model_validate_json(plan_json)
+        except AttributeError:
+            plan = PlanModel.parse_raw(plan_json)
+    except ValidationError as e:
         raise HTTPException(status_code=500, detail=f"Planner produced invalid JSON: {e}\n{plan_json}")
+    return plan.model_dump()
 
 def extract_code(code_text: str) -> str:
     m = _CODE_FENCE_RE.search(code_text)
@@ -122,14 +144,20 @@ def execute_plan(plan: dict) -> dict:
             f"OUTPUTS: {outputs}\n"
         )
         last_error = None
+        last_code = ""
         max_retries = 5
         for attempt in range(1, max_retries+1):
             # If error on previous attempt, ask to fix
             prompt = prompt_base
             if last_error:
-                prompt += f"Error on attempt {attempt-1}: {last_error}\nPlease correct the code."  # no code fences
+                prompt += (
+                    f"Error on attempt {attempt-1}: {last_error}\n"
+                    f"Previous code:\n{last_code}\n"
+                    "Please correct the code."
+                )
             code = call_llm(CODER_SYSTEM, prompt)
             code = extract_code(code)
+            last_code = code
             # Write temp script
             with tempfile.NamedTemporaryFile(mode="w+", suffix=".py", delete=False) as tmp:
                 tmp.write(textwrap.dedent("""
