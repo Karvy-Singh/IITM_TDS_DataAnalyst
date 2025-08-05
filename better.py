@@ -1,215 +1,440 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import PlainTextResponse
-import google.generativeai as genai
-import subprocess
-import sys
-import tempfile
 import os
+import re
 import json
 import asyncio
-import re
-from typing import Optional
+import tempfile
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi.responses import JSONResponse,Response
+from pydantic import BaseModel, ValidationError
+
+# ---- LLM client (OpenAI-compatible) -----------------------------------------
 from openai import OpenAI
 
-API_KEY = ""
-client = OpenAI(api_key=API_KEY,
-                base_url="https://aipipe.org/openrouter/v1/")
+LLM_API_KEY = ""
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+PLANNER_MODEL = os.getenv("LLM_PLANNER_MODEL", "gpt-4o")
+CODER_MODEL = os.getenv("LLM_CODER_MODEL", "gpt-4.1")
+DEBUGGER_MODEL = os.getenv("LLM_DEBUGGER_MODEL", "gpt-4.1")
+INTERPRETER_MODEL = os.getenv("LLM_INTERPRETER_MODEL", "gpt-4o")
+FORMATTER_MODEL = os.getenv("LLM_INTERPRETER_MODEL", "gpt-4o")
 
-app = FastAPI(title="Universal Data Analyst", version="1.0.0")
+if not LLM_API_KEY:
+    # You can still run /health and / endpoints; /api/ will error clearly.
+    pass
+client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
-def call_llm(system_prompt: str, user_prompt: str, model: str = "gpt-4o-mini") -> str:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        temperature=0
-    )
-    return response.choices[0].message.content.strip()
+app = FastAPI(title="Universal Data Analyst (no explicit format/datasets)", version="3.0.0")
 
-_CODE_FENCE_RE = re.compile(r"```(?:python)?\s*([\s\S]*?)```", re.IGNORECASE)
+# ---- Prompts ----------------------------------------------------------------
+PLANNER_SYSTEM = """You are a planning engine. Output STRICT JSON that validates this schema:
 
-def extract_code(code_text: str) -> str:
-    m = _CODE_FENCE_RE.search(code_text)
-    code = m.group(1) if m else code_text
-    lines = code.splitlines()
-    if lines and lines[0].strip().lower() == "python":
-        lines = lines[1:]
-    return "\n".join(lines).strip()
+{
+  "type": "object",
+  "properties": {
+    "question": { "type": "string" },
+    "parameters": { "type": "object" },
+    "steps": { "type": "array", "items": { "type": "string" } },
+    "final_variables": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["question", "parameters", "steps", "final_variables"],
+  "additionalProperties": false
+}
 
-# Prompt Templates
-PLANNER_SYSTEM = """Role: You are an AI assistant that specializes in breaking down complex questions into programmable Python code and extracting parameters from the question for implementation.
+Do NOT include any output format hints (e.g., json, yaml, html, markdown) and do NOT list datasets/URLs.
+Return JSON only. No prose.
+"""
 
-Task: Given a specific question regarding data scraping OR analysis, create a plan that accomplishes the following:
-1. Scrapes data from the provided URL (IF APPLICABLE)
-2. Derives parameters necessary for the analysis from the question
-3. Outputs answers to the specified sub-questions in a structured format
+CODER_SYSTEM = """Write ONLY Python code. No comments. Do not print anything except one final print(json.dumps(final_result)).
+Use ONLY the provided helpers for network I/O and visualization.
 
-Output Format:
-- The response should include:
-- Clearly defined variables for parameters extracted from the question
-- The expected output type as extracted from the question itself (e.g., JSON, image data URI, yaml, OR anything else possible)
-- Variable names that should be assigned in the final code
+Helpers available (already imported in the runtime):
+- fetch_text(url: str, timeout: int = 20, retries: int = 2) -> str
+- fetch_json(url: str, timeout: int = 20) -> dict
+- read_table_html(html: str) -> list[pandas.DataFrame]
+- df_to_records(df: pandas.DataFrame) -> list[dict]
+- fig_to_data_uri(fig) -> str  # returns a data:image/png;base64,... string
 
-Tone: Formal and technical."""
+Allowed imports: json, math, statistics, re, datetime, io, base64, pandas as pd, numpy as np, matplotlib.pyplot as plt.
 
-LIBRARY_PLANNER = """Role: You are a senior software developer.
+Contract (internal only):
+- Compute results with Python (not the LLM).
+- If you make charts, convert them with fig_to_data_uri(fig).
+- Produce: final_result = {
+    "answer": <any JSON-serializable value>,
+    "tables": { "<name>": [ {<record>}, ... ] },
+    "images": [ "data:image/png;base64,...", ... ],
+    "logs": [ "string messages with dataset shapes, sanity checks, etc." ]
+  }
+- End with: print(json.dumps(final_result))
+"""
 
-Task: You will receive a plan, after analyzing, you will give out all proper python library names for pip installing them, which will be required to execute the plan, in a JSON format with field called "requirements"."""
+DEBUGGER_SYSTEM = """You are a precise code fixer.
+Given:
+- A plan (JSON)
+- The previous code
+- Its stderr and stdout
+- The required output contract (final_result as JSON printed once)
 
-CODER_SYSTEM = """You are a reliable code generator.
+Return ONLY corrected Python code that:
+- Uses the provided helpers for network I/O
+- Avoids disallowed imports
+- Prints exactly one line: json.dumps(final_result)
+- Produces valid JSON per the contract
+No commentary. Code only.
+"""
+
+# The formatter infers the desired outward representation from the user question.
+# It must return a SINGLE string (no code fences). It may choose CSV/JSON text/Markdown/HTML/data URI/etc.
+OUTPUT_FORMATTER_SYSTEM = """You are an output formatter.
+Goal: Given the original user question and a JSON object `final_result` (with fields answer/tables/images/logs),
+produce a SINGLE plain-text string that matches the output/reponse format explicitly requested by the question.
+If the question requests a very specific format (e.g., "CSV with columns ...", "a single data URI image", "raw JSON", "HTML table"),
+produce exactly that format. Strictly follow column order and field names if provided.
+If the question does NOT specify any particular format, produce a short, clear Markdown report.
 
 Rules:
-- Write ONLY Python code (no prose, no comments, no print/logging statements)
-- The code MUST print ONLY the final result to stdout using print() at the end
-- Assign variables as needed but ensure the final result is printed
-- Do not read/write local files unless explicitly requested; fetch via provided helpers
-- Be robust:
-  - When scraping HTML, handle missing nodes
-  - Handle empty/NaN rows sensibly
-  - Do whatever sensible data cleaning is required to achieve proper results
-- If a library may be missing, prefer pure-Python or built-in alternatives when feasible
-- The final line of code should always be: print(final_result)"""
-
-INTERPRETER_SYSTEM = """
-You are a data-analysis interpreter. Given the original user request, the plan, and the final output variables, produce a response in structure/expected output type as specified by the plan.
-
-If no response_type is specified, return a Markdown report with the following structure:
-1. Summary of what was done
-2. Key findings (tables, charts, numbers)
-3. Conclusions or next steps
-4. Caveats if any
-"""
-DEBUG_SYSTEM ="""
-Role: You are an intelligent debugger.
-You need to debug/modify/update code in any way possible to get the original results as intended by the code with errors.
+- Output ONE string only. No surrounding code fences. No explanations.
+- Do not invent data; use the provided `final_result`.
+- For CSV: include a header row. Use commas, newline-separated rows.
+- For JSON: output compact valid JSON (minimize whitespace).
+- For HTML table(s): output minimal valid HTML (no external CSS/JS).
+- For images-only requests: output the data URI(s), one per line, nothing else.
 """
 
-def install_libraries(requirements: list) -> bool:
-    """Install required Python libraries"""
-    for req in requirements:
+# ---- Helper code injected into the execution sandbox ------------------------
+HELPERS = r"""
+import json, base64, io, time, math, statistics, re, datetime
+import requests, pandas as pd
+from bs4 import BeautifulSoup
+import numpy as np
+import matplotlib.pyplot as plt
+
+def fetch_text(url, timeout=20, retries=2):
+    last = None
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; UDA/3.0)"}
+    for _ in range(retries+1):
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", req], 
-                                stdout=subprocess.DEVNULL, 
-                                stderr=subprocess.DEVNULL)
-        except subprocess.CalledProcessError:
-            return False
-    return True
+            r = requests.get(url, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last = e
+            time.sleep(1)
+    raise last
 
-async def run_python_code(code: str, timeout: int = 300) -> tuple[str, str, int]:
-    """Run Python code as subprocess and return stdout, stderr, returncode"""
+def fetch_json(url, timeout=20):
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; UDA/3.0)"}
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def read_table_html(html):
     try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        dfs = pd.read_html(html)
+        return dfs
+    except Exception:
+        soup = BeautifulSoup(html, "lxml")
+        tables = soup.find_all("table")
+        if not tables:
+            return []
+        out = []
+        for t in tables:
+            try:
+                out.append(pd.read_html(str(t))[0])
+            except Exception:
+                pass
+        return out
+
+def df_to_records(df):
+    return df.replace({pd.NA: None, np.nan: None}).to_dict(orient="records")
+
+def fig_to_data_uri(fig):
+    import io, base64
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+"""
+
+# ---- Models / Validators -----------------------------------------------------
+class Plan(BaseModel):
+    question: str
+    parameters: Dict[str, Any]
+    steps: List[str]
+    final_variables: List[str]
+
+REQUIRED_FINAL_KEYS = {"answer", "tables", "images", "logs"}
+
+# ---- Utilities ---------------------------------------------------------------
+_CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*([\s\S]*?)```", re.IGNORECASE)
+
+def extract_code(text: str) -> str:
+    m = _CODE_FENCE_RE.search(text)
+    code = m.group(1) if m else text
+    return code.strip()
+
+def coerce_json(text: str) -> Dict[str, Any]:
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            snippet = text[start : end + 1]
+            return json.loads(snippet)
+        raise
+
+def llm_call(system_prompt: str, user_prompt: str, model: str, temperature: float = 0) -> str:
+    if not LLM_API_KEY:
+        raise HTTPException(status_code=500, detail="LLM_API_KEY/OPENAI_API_KEY is not set.")
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    return resp.choices[0].message.content.strip()
+
+def plan_question(question: str) -> Plan:
+    out = llm_call(PLANNER_SYSTEM, question, PLANNER_MODEL)
+    try:
+        data = coerce_json(out)
+        return Plan(**data)
+    except Exception:
+        # Re-ask with stronger instruction
+        question2 = question + "\n\nReturn VALID JSON only. No commentary."
+        out2 = llm_call(PLANNER_SYSTEM, question2, PLANNER_MODEL)
+        data2 = coerce_json(out2)
+        return Plan(**data2)
+
+DANGEROUS_IMPORTS = {
+    "subprocess","os","sys","shutil","socket","pathlib","multiprocessing",
+    "asyncio","http.server","flask","fastapi","uvicorn","openai","shlex","pexpect"
+}
+
+def contains_dangerous_imports(code: str) -> Optional[str]:
+    lines = code.splitlines()
+    for i, ln in enumerate(lines, 1):
+        s = ln.strip()
+        if s.startswith("import ") or s.startswith("from "):
+            for bad in DANGEROUS_IMPORTS:
+                if re.search(rf"\b{re.escape(bad)}\b", s):
+                    return f"Line {i}: disallowed import: {s}"
+    return None
+
+async def run_python_code(code: str, timeout: int = 120) -> Tuple[str, str, int]:
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             f.write(code)
             temp_file = f.name
-        
-        process = await asyncio.create_subprocess_exec(
+
+        proc = await asyncio.create_subprocess_exec(
             sys.executable, temp_file,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
-        
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-            return stdout.decode(), stderr.decode(), process.returncode
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return stdout.decode(), stderr.decode(), proc.returncode
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            proc.kill()
+            await proc.wait()
             return "", "Process timed out", -1
         finally:
-            os.unlink(temp_file)
-            
+            try:
+                os.unlink(temp_file)
+            except Exception:
+                pass
     except Exception as e:
         return "", f"Execution error: {str(e)}", -1
 
-@app.post("/api/", response_class=PlainTextResponse)
-async def analyze_question(file: UploadFile = File(...)):
-    """Main endpoint that accepts question file and returns analysis result"""
+def validate_final_result(stdout_text: str) -> Dict[str, Any]:
+    data = coerce_json(stdout_text)
+    if not isinstance(data, dict):
+        raise ValueError("Output is not a JSON object.")
+    missing = REQUIRED_FINAL_KEYS - set(data.keys())
+    if missing:
+        raise ValueError(f"Output missing required keys: {sorted(missing)}")
+    if not isinstance(data["tables"], dict):
+        raise ValueError("final_result.tables must be a dict of name -> list[dict].")
+    if not isinstance(data["images"], list):
+        raise ValueError("final_result.images must be a list.")
+    if not isinstance(data["logs"], list):
+        raise ValueError("final_result.logs must be a list.")
+    return data
+
+def make_coder_prompt(plan: Plan) -> str:
+    schema_hint = """Internal final_result schema (for reliability):
+{
+  "answer": <any JSON-serializable>,
+  "tables": { "<name>": [ {<record>}, ... ] },
+  "images": [ "data:image/png;base64,...", ... ],
+  "logs": [ "string", ... ]
+}
+"""
+    return (
+        f"Original question:\n{plan.question}\n\n"
+        f"Plan JSON (no output format hints, no datasets):\n{plan.model_dump_json(indent=2)}\n\n"
+        f"{schema_hint}\n"
+        "Write the analysis code now."
+    )
+
+def make_debugger_prompt(plan: Plan, prev_code: str, stdout_text: str, stderr_text: str) -> str:
+    s_out = stdout_text[-2000:]
+    s_err = stderr_text[-2000:]
+    s_code = prev_code[-4000:]
+    return (
+        "PLAN (JSON):\n"
+        + plan.model_dump_json(indent=2)
+        + "\n\nPREVIOUS CODE:\n"
+        + s_code
+        + "\n\nSTDOUT (tail):\n"
+        + s_out
+        + "\n\nSTDERR (tail):\n"
+        + s_err
+        + "\n\nPlease return corrected Python code only."
+    )
+
+def build_executable_source(generated_code: str) -> str:
+    return HELPERS + "\n\n" + generated_code + "\n"
+
+def make_formatter_prompt(question: str, final_result: Dict[str, Any]) -> str:
+    payload = {
+        "question": question,
+        "final_result": final_result,
+    }
+    return json.dumps(payload, indent=2)
+
+# ---- API --------------------------------------------------------------------
+@app.post("/api/")
+async def analyze_question(
+    file: UploadFile = File(...),
+    debug: int = Query(0, description="Set to 1 to include debug payloads (JSON)."),
+):
+    if not LLM_API_KEY:
+        raise HTTPException(status_code=500, detail="LLM_API_KEY/OPENAI_API_KEY is not set.")
+
+    content = await file.read()
+    question = content.decode("utf-8").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Empty question file")
+
+    # 1) Plan (no output format hints, no datasets)
     try:
-        # Read the question from uploaded file
-        content = await file.read()
-        question = content.decode('utf-8').strip()
-        
-        if not question:
-            raise HTTPException(status_code=400, detail="Empty question file")
-        
-        # Step 1: Create analysis plan
-        plan = call_llm(PLANNER_SYSTEM, question)
-        
-        # Step 2: Determine required libraries
-        library_response = call_llm(LIBRARY_PLANNER, plan)
-        
-        try:
-            library_data = json.loads(library_response)
-            requirements = library_data.get("requirements", [])
-        except json.JSONDecodeError:
-            # Fallback common libraries
-            requirements = ["requests", "beautifulsoup4", "pandas", "numpy", "matplotlib", "seaborn"]
-        
-        # Step 3: Install libraries
-        install_success = install_libraries(requirements)
-        if not install_success:
-            return "Error: Failed to install required libraries"
-        
-        # Step 4: Generate code with retry logic
-        code_prompt = f"Plan: {plan}\n\nGenerate Python code to execute this plan. Remember to print the final result."
-        generated_code = call_llm(CODER_SYSTEM, code_prompt)
-        generated_code = extract_code(generated_code)
-
-        max_retries = 5
-        last_error = None
-        for attempt in range(1, max_retries + 1):
-            # Step 5: Execute code as subprocess
-            
-            stdout, stderr, returncode = await run_python_code(generated_code)
-            if returncode == 0:
-                break
-            last_error = stderr.strip()
-            # Correction prompt for LLM
-            if last_error==None:
-                break
-            correction_prompt = (
-                f"{code_prompt}\n\n"
-                f"Previous code resulted in error (attempt {attempt}):\n{last_error}\n"
-                "Please correct the code and ensure it prints the final result."
-            )
-            generated_code = call_llm(DEBUG_SYSTEM, correction_prompt)
-            generated_code = extract_code(generated_code)
-        else:
-            return f"Execution Error after {max_retries} attempts:\n{last_error}"
-
-        if not stdout.strip():
-            return "No output generated from analysis"
-
-        # Step 6: Use interpreter to structure the final answer
-        raw_output = stdout.strip()
-        interpreter_prompt = f"""Plan: {plan}
-
-Generated Code Output:
-{raw_output}
-
-Please interpret these results and provide a structured response according to the plan's expected output format."""
-        
-        final_structured_result = call_llm(INTERPRETER_SYSTEM, interpreter_prompt)
-        
-        return final_structured_result
-        
+        plan = plan_question(question)
+    except ValidationError as ve:
+        raise HTTPException(status_code=500, detail=f"Planner JSON invalid: {ve}")
     except Exception as e:
-        return f"Analysis failed: {str(e)}"
+        raise HTTPException(status_code=500, detail=f"Planner failed: {e}")
+
+    # 2) Generate code
+    coder_prompt = make_coder_prompt(plan)
+    raw_code = llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL)
+    generated_code = extract_code(raw_code)
+
+    # quick safety check
+    bad = contains_dangerous_imports(generated_code)
+    if bad:
+        dbg_prompt = make_debugger_prompt(plan, generated_code, "", bad)
+        raw_fixed = llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL)
+        generated_code = extract_code(raw_fixed)
+
+    # 3) Execute with retries + debugger
+    MAX_RETRIES = 3
+    last_stdout = ""
+    last_stderr = ""
+    last_code = generated_code
+    final_structured: Optional[Dict[str, Any]] = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        to_run = build_executable_source(last_code)
+        stdout, stderr, returncode = await run_python_code(to_run)
+        last_stdout, last_stderr = stdout, stderr
+
+        if returncode == 0:
+            try:
+                final_structured = validate_final_result(stdout.strip())
+                break
+            except Exception as ve:
+                dbg_prompt = make_debugger_prompt(plan, last_code, stdout, f"ValidationError: {ve}")
+                raw_fixed = llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL)
+                last_code = extract_code(raw_fixed)
+                continue
+        else:
+            dbg_prompt = make_debugger_prompt(plan, last_code, stdout, stderr)
+            raw_fixed = llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL)
+            last_code = extract_code(raw_fixed)
+
+    if final_structured is None:
+        if debug == 1:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "ok": False,
+                    "error": "Execution failed after retries.",
+                    "stderr_tail": last_stderr[-1000:],
+                    "stdout_tail": last_stdout[-1000:],
+                    "plan": plan.model_dump(),
+                    "generated_code": last_code,
+                },
+            )
+        return Response(
+            "Execution failed after retries.\n"
+            f"STDERR (tail):\n{last_stderr[-1000:]}\n\nSTDOUT (tail):\n{last_stdout[-1000:]}\n",
+            media_type="text/plain",
+            status_code=500,
+        )
+
+    # 4) Format the outgoing payload purely based on the question (no explicit type)
+    fmt_prompt = make_formatter_prompt(question, final_structured)
+    formatted = llm_call(OUTPUT_FORMATTER_SYSTEM, fmt_prompt, FORMATTER_MODEL)
+
+    if debug == 1:
+        return JSONResponse(
+            {
+                "ok": True,
+                "formatted_output": formatted,
+                "internal_final_result": final_structured,
+                "debug": {
+                    "plan": plan.model_dump(),
+                    "generated_code": last_code,
+                    "stdout_tail": last_stdout[-2000:],
+                    "stderr_tail": last_stderr[-2000:],
+                    "models": {
+                        "planner": PLANNER_MODEL,
+                        "coder": CODER_MODEL,
+                        "debugger": DEBUGGER_MODEL,
+                        "formatter": FORMATTER_MODEL,
+                        "base_url": LLM_BASE_URL,
+                    },
+                },
+            }
+        )
+
+    # Default to plain text so we don't force a content type;
+    # the formatter will have produced the requested format as text.
+    return Response(formatted, media_type="text/plain")
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {"status": "healthy"}
 
 @app.get("/")
 async def root():
-    """Root endpoint with usage information"""
     return {
-        "message": "Universal Data Analyst API",
-        "usage": "curl 'https://app.example.com/api/' -F '@question.txt'",
-        "endpoint": "/api/ (POST with file upload)"
+        "message": "Universal Data Analyst API v3 (no explicit output type / no datasets in plan)",
+        "usage": "curl -s -X POST 'http://localhost:8000/api/?debug=1' -F 'file=@question.txt'",
+        "notes": [
+            "The planner never specifies output format or datasets.",
+            "The coder produces a reliable JSON object internally.",
+            "The formatter infers the outward format from the question and returns plain text."
+        ]
     }
 
 if __name__ == "__main__":
