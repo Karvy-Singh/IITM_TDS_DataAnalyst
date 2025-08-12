@@ -49,13 +49,27 @@ Return JSON only. No prose.
 
 CODER_SYSTEM = """Write ONLY Python code. No comments. Do not print anything except one final print(json.dumps(final_result)).
 Use ONLY the provided helpers for network I/O and visualization.
+
+Local files do not exist. Use these helpers for uploads:
+- list_attachments()
+- read_text_attachment(name, encoding="utf-8")
+- read_json_attachment(name)
+- read_csv_attachment(name, **pandas_read_csv_kwargs)
+- read_excel_attachment(name, **pandas_kwargs)
+- read_parquet_attachment(name, **pandas_kwargs)  # requires pyarrow/fastparquet in env
+- read_image_attachment(name)  # returns PIL.Image.Image if Pillow available, else numpy array
+- load_dataframe_auto(name)  # infers by extension
+- is_image_name(name) -> bool
+
 Helpers available (already imported in the runtime):
 - fetch_text(url: str, timeout: int = 20, retries: int = 2) -> str
 - fetch_json(url: str, timeout: int = 20) -> dict
 - read_table_html(html: str) -> list[pandas.DataFrame]
 - df_to_records(df: pandas.DataFrame) -> list[dict]
 - fig_to_data_uri(fig) -> str  # returns a data:image/png;base64,... string
+
 Allowed imports: json, math, statistics, re, datetime, io, base64, pandas as pd, numpy as np, matplotlib.pyplot as plt.
+
 Contract (internal only):
 - Compute results with Python (not the LLM).
 - If you make charts, convert them with fig_to_data_uri(fig).
@@ -312,8 +326,87 @@ def make_debugger_prompt(plan: Plan, prev_code: str, stdout_text: str, stderr_te
         + "\n\nPlease return corrected Python code only."
     )
 
-def build_executable_source(generated_code: str) -> str:
-    return HELPERS + "\n\n" + generated_code + "\n"
+def build_executable_source(generated_code: str, attachments: List[Dict[str, Any]]) -> str:
+    attachments_py_json = json.dumps(attachments, separators=(",", ":"))
+    prelude = f"""
+ATTACHMENTS = {attachments_py_json}
+
+import base64, io, json, pandas as pd, numpy as np
+
+try:
+    import pyarrow  # noqa: F401
+    _HAS_ARROW = True
+except Exception:
+    _HAS_ARROW = False
+
+try:
+    from PIL import Image
+    _HAS_PIL = True
+except Exception:
+    _HAS_PIL = False
+
+def _get_bytes(name):
+    for a in ATTACHMENTS:
+        if a["filename"] == name:
+            return base64.b64decode(a["data_b64"])
+    raise FileNotFoundError(name)
+
+def list_attachments():
+    return [{{"filename": a["filename"], "content_type": a["content_type"], "size": a["size"]}} for a in ATTACHMENTS]
+
+def read_text_attachment(name, encoding="utf-8"):
+    return _get_bytes(name).decode(encoding, errors="replace")
+
+def read_json_attachment(name):
+    return json.loads(read_text_attachment(name))
+
+def read_csv_attachment(name, **kwargs):
+    return pd.read_csv(io.BytesIO(_get_bytes(name)), **kwargs)
+
+def read_excel_attachment(name, **kwargs):
+    return pd.read_excel(io.BytesIO(_get_bytes(name)), **kwargs)
+
+def read_parquet_attachment(name, **kwargs):
+    if not _HAS_ARROW:
+        raise RuntimeError("Parquet requires pyarrow or fastparquet.")
+    return pd.read_parquet(io.BytesIO(_get_bytes(name)), **kwargs)
+
+def read_image_attachment(name):
+    b = _get_bytes(name)
+    if _HAS_PIL:
+        return Image.open(io.BytesIO(b))
+    import matplotlib.image as mpimg
+    return mpimg.imread(io.BytesIO(b))
+
+def load_dataframe_auto(name):
+    low = name.lower()
+    if low.endswith(".csv"):
+        return read_csv_attachment(name)
+    if low.endswith(".json"):
+        js = read_json_attachment(name)
+        if isinstance(js, list):
+            return pd.DataFrame(js)
+        if isinstance(js, dict):
+            return pd.json_normalize(js)
+        raise ValueError("JSON not table-like")
+    if low.endswith(".xlsx") or low.endswith(".xls"):
+        return read_excel_attachment(name)
+    if low.endswith(".parquet") or low.endswith(".pq"):
+        return read_parquet_attachment(name)
+    try:
+        return read_csv_attachment(name)
+    except Exception:
+        try:
+            js = read_json_attachment(name)
+            return pd.json_normalize(js) if isinstance(js, dict) else pd.DataFrame(js)
+        except Exception:
+            raise ValueError(f"Unsupported tabular file: {{name}}")
+
+def is_image_name(name):
+    return name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"))
+"""
+    return HELPERS + "\n" + prelude + "\n" + generated_code + "\n"
+
 
 def make_formatter_prompt(question: str, final_result: Dict[str, Any]) -> str:
     payload = {
@@ -448,7 +541,7 @@ async def analyze_question(
     final_structured: Optional[Dict[str, Any]] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
-        to_run = build_executable_source(last_code)
+        to_run = build_executable_source(last_code,file_blobs)
         stdout, stderr, returncode = await run_python_code(to_run)
         last_stdout, last_stderr = stdout, stderr
 
