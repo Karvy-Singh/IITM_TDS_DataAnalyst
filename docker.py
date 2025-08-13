@@ -15,20 +15,17 @@ from pydantic import BaseModel, ValidationError
 from openai import AsyncOpenAI
 
 LLM_API_KEY = os.getenv("OPENAI_API_KEY")
-LLM_BASE_URL = "https://api.openai.com/v1"
+LLM_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+# Use one family only, but keep roles separated for temperature control
 PLANNER_MODEL ="gpt-4o-mini"
 CODER_MODEL = "gpt-4o-mini"
 DEBUGGER_MODEL = "gpt-4o-mini"
-INTERPRETER_MODEL = "gpt-4o-mini"
 FORMATTER_MODEL = "gpt-4o-mini"
-
-if not LLM_API_KEY:
-    # You can still run /health and / endpoints; /api/ will error clearly.
-    pass
 
 client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
-app = FastAPI(title="Universal Data Analyst (no explicit format/datasets)", version="3.0.0")
+app = FastAPI(title="Universal Data Analyst (robust, format-aware)", version="4.0.0")
 
 # ---- Prompts ----------------------------------------------------------------
 PLANNER_SYSTEM = """You are a planning engine. Output STRICT JSON that validates this schema:
@@ -38,78 +35,73 @@ PLANNER_SYSTEM = """You are a planning engine. Output STRICT JSON that validates
     "question": { "type": "string" },
     "parameters": { "type": "object" },
     "steps": { "type": "array", "items": { "type": "string" } },
-    "final_variables": { "type": "array", "items": { "type": "string" } }
+    "final_variables": { "type": "array", "items": { "type": "string" } },
+    "requirements": {
+      "type": "object",
+      "properties": {
+        "expected_format": { "type": "string", "enum": ["markdown","json_object","json_array","csv","html_table","images_only","text"] },
+        "required_keys": { "type": "array", "items": { "type": "string" } },
+        "size_constraints": { "type": "object" }
+      },
+      "required": ["expected_format"]
+    }
   },
-  "required": ["question", "parameters", "steps", "final_variables"],
+  "required": ["question", "parameters", "steps", "final_variables", "requirements"],
   "additionalProperties": false
 }
-Do NOT include any output format hints (e.g., json, yaml, html, markdown) and do NOT list datasets/URLs.
-Return JSON only. No prose.
+Derive `requirements` only from the question text. Return JSON only. No prose, no hints.
 """
 
 CODER_SYSTEM = """Write ONLY Python code. No comments. Do not print anything except one final print(json.dumps(final_result)).
-Use ONLY the provided helpers for network I/O and visualization.
 
-Local files do not exist. Use these helpers for uploads:
-- list_attachments()
-- read_text_attachment(name, encoding="utf-8")
-- read_json_attachment(name)
-- read_csv_attachment(name, **pandas_read_csv_kwargs)
-- read_excel_attachment(name, **pandas_kwargs)
-- read_parquet_attachment(name, **pandas_kwargs)  # requires pyarrow/fastparquet in env
-- read_image_attachment(name)  # returns PIL.Image.Image if Pillow available, else numpy array
-- load_dataframe_auto(name)  # infers by extension
-- is_image_name(name) -> bool
+You must:
+- Discover and load inputs from attachments using: list_attachments(), load_dataframe_auto(), read_*_attachment(), is_image_name().
+- Never read local files by path. Never call pandas read_* with a filename string. Local files do not exist.
+- For web data: use fetch_text() and read_table_html(). Do not import or use requests/urllib/BeautifulSoup directly; helpers already exist.
+- When parsing HTML tables: call read_table_html(html). Select the most relevant/largest table. If columns are MultiIndex, flatten them. Strip $, %, and commas before numeric ops; use pandas to_numeric(errors="coerce").
+- When computing stats/correlation: coerce to numeric with errors='coerce' and dropna.
+- When plotting: use matplotlib.pyplot only. Create small figures (e.g., figsize=(4.8,3.2), dpi<=100) so base64 PNGs stay <100kB when required. Convert with fig_to_data_uri(fig).
+- If the question asks for specific image keys (e.g., temp_line_chart), include those keys INSIDE final_result['answer'] as data URIs.
+- If the question asks for CSV/HTML/JSON array/object, set final_result['answer'] to exactly that type and schema.
 
-Helpers available (already imported in the runtime):
-- fetch_text(url: str, timeout: int = 20, retries: int = 2) -> str
-- fetch_json(url: str, timeout: int = 20) -> dict
-- read_table_html(html: str) -> list[pandas.DataFrame]
-- df_to_records(df: pandas.DataFrame) -> list[dict]
-- fig_to_data_uri(fig) -> str  # returns a data:image/png;base64,... string
+Contract to print:
+final_result = {
+  "answer": <any JSON-serializable value that satisfies the user's requested outward format>,
+  "tables": { "<name>": [ {<record>}, ... ] },
+  "images": [ "data:image/png;base64,...", ... ],
+  "logs": [ "string messages with dataset shapes, sanity checks, etc." ]
+}
 
 Allowed imports: json, math, statistics, re, datetime, io, base64, pandas as pd, numpy as np, matplotlib.pyplot as plt.
 
-Contract (internal only):
-- Compute results with Python (not the LLM).
-- If you make charts, convert them with fig_to_data_uri(fig).
-- Produce: final_result = {
-    "answer": <any JSON-serializable value>,
-    "tables": { "<name>": [ {<record>}, ... ] },
-    "images": [ "data:image/png;base64,...", ... ],
-    "logs": [ "string messages with dataset shapes, sanity checks, etc." ]
-  }
-- End with: print(json.dumps(final_result))
-"""
+End with: print(json.dumps(final_result))"""
 
 DEBUGGER_SYSTEM = """You are a precise code fixer.
+
 Given:
 - A plan (JSON)
 - The previous code
 - Its stderr and stdout
 - The required output contract (final_result as JSON printed once)
+
 Return ONLY corrected Python code that:
-- Uses the provided helpers for network I/O
-- Avoids disallowed imports
+- Loads data ONLY via provided attachment helpers or fetch_text/read_table_html
+- Does NOT use local file paths or direct requests/urllib/bs4
+- Ensures final_result['answer'] EXACTLY matches the requested outward format and includes any required base64 images under the specified keys
+- Keeps PNGs reasonably small (figure size/dpi) when size limits are mentioned
 - Prints exactly one line: json.dumps(final_result)
 - Produces valid JSON per the contract
-No commentary. Code only.
-"""
+
+No commentary. Code only."""
 
 OUTPUT_FORMATTER_SYSTEM = """You are an output formatter.
-Goal: Given the original user question and a JSON object `final_result` (with fields answer/tables/images/logs),
-produce a SINGLE plain-text string that matches the output/reponse format explicitly requested by the question.
-If the question requests a very specific format (e.g., "CSV with columns ...", "a single data URI image", "raw JSON", "HTML table"),
-produce exactly that format. Strictly follow column order and field names if provided.
-If the question does NOT specify any particular format, produce a short, clear Markdown report.
+Goal: Given the original user question and JSON `final_result`, output a SINGLE plain-text string matching the exact format requested by the question.
+
 Rules:
-- Output ONE string only. No surrounding code fences. No explanations.
-- Do not invent data; use the provided `final_result`.
-- For CSV: include a header row. Use commas, newline-separated rows.
-- For JSON: output compact valid JSON (minimize whitespace).
-- For HTML table(s): output minimal valid HTML (no external CSS/JS).
-- For images-only requests: output the data URI(s), one per line, nothing else.
-"""
+- If the question specifies a concrete structure (e.g., JSON object/array with required keys, CSV with specific columns, HTML table, or base64-encoded images under named keys), output EXACTLY that using final_result['answer'] as the source of truth. Do not invent or omit keys.
+- Otherwise, produce a short Markdown report from final_result.
+
+Output ONE string only. No code fences or extra commentary."""
 
 # ---- Helper code injected into the execution sandbox ------------------------
 HELPERS = r"""
@@ -118,9 +110,10 @@ import requests, pandas as pd
 from bs4 import BeautifulSoup
 import numpy as np
 import matplotlib.pyplot as plt
+
 def fetch_text(url, timeout=20, retries=2):
     last = None
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; UDA/3.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; UDA/4.0)"}
     for _ in range(retries+1):
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
@@ -130,11 +123,13 @@ def fetch_text(url, timeout=20, retries=2):
             last = e
             time.sleep(1)
     raise last
+
 def fetch_json(url, timeout=20):
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; UDA/3.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; UDA/4.0)"}
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.json()
+
 def read_table_html(html):
     try:
         dfs = pd.read_html(html)
@@ -151,12 +146,14 @@ def read_table_html(html):
             except Exception:
                 pass
         return out
+
 def df_to_records(df):
     return df.replace({pd.NA: None, np.nan: None}).to_dict(orient="records")
+
 def fig_to_data_uri(fig):
     import io, base64
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=fig.dpi if hasattr(fig, "dpi") else 100)
     plt.close(fig)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 """
@@ -167,6 +164,7 @@ class Plan(BaseModel):
     parameters: Dict[str, Any]
     steps: List[str]
     final_variables: List[str]
+    requirements: Dict[str, Any]
 
 REQUIRED_FINAL_KEYS = {"answer", "tables", "images", "logs"}
 
@@ -223,19 +221,20 @@ async def llm_call(
     return resp.choices[0].message.content.strip()
 
 async def plan_question(question: str) -> Plan:
-    out = await llm_call(PLANNER_SYSTEM, question, PLANNER_MODEL)
+    out = await llm_call(PLANNER_SYSTEM, question, PLANNER_MODEL, temperature=0.2)
     try:
         data = await coerce_json(out)
         return Plan(**data)
     except Exception:
         question2 = question + "\n\nReturn VALID JSON only. No commentary."
-        out2 = await llm_call(PLANNER_SYSTEM, question2, PLANNER_MODEL)
+        out2 = await llm_call(PLANNER_SYSTEM, question2, PLANNER_MODEL, temperature=0.2)
         data2 = await coerce_json(out2)
         return Plan(**data2)
 
 DANGEROUS_IMPORTS = {
     "subprocess","os","sys","shutil","socket","pathlib","multiprocessing",
-    "asyncio","http.server","flask","fastapi","openai","shlex","pexpect","uvicorn"
+    "asyncio","http.server","flask","fastapi","openai","shlex","pexpect","uvicorn",
+    "requests","urllib","selenium","bs4","BeautifulSoup"
 }
 
 async def contains_dangerous_imports(code: str) -> Optional[str]:
@@ -248,31 +247,49 @@ async def contains_dangerous_imports(code: str) -> Optional[str]:
                     return f"Line {i}: disallowed import: {s}"
     return None
 
-async def run_python_code(code: str, timeout: int = 120) -> Tuple[str, str, int]:
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write(code)
-            temp_file = f.name
+_LOCAL_IO_PATTERNS = [
+    r"\bpd\.read_csv\(\s*['\"][^)\s]+['\"]\s*\)",
+    r"\bpd\.read_excel\(\s*['\"][^)\s]+['\"]\s*\)",
+    r"\bpd\.read_json\(\s*['\"][^)\s]+['\"]\s*\)",
+    r"\bpd\.read_parquet\(\s*['\"][^)\s]+['\"]\s*\)",
+    r"\bopen\(\s*['\"][^)\s]+['\"]\s*[,)]",
+    r"\bos\.path\b",
+    r"\bPath\(",
+]
 
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, temp_file,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            return stdout.decode(), stderr.decode(), proc.returncode
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return "", "Process timed out", -1
-        finally:
-            try:
-                os.unlink(temp_file)
-            except Exception:
-                pass
-    except Exception as e:
-        return "", f"Execution error: {str(e)}", -1
+async def contains_local_file_io(code: str) -> Optional[str]:
+    for i, ln in enumerate(code.splitlines(), 1):
+        s = ln.strip()
+        for pat in _LOCAL_IO_PATTERNS:
+            if re.search(pat, s):
+                return f"Line {i}: local file I/O is not allowed: {s}"
+    return None
+
+# ---- Requirement-aware validator --------------------------------------------
+_REQ_JSON_KEYS = re.compile(r"Return a JSON object with keys?:\s*(.+)", re.IGNORECASE | re.DOTALL)
+_REQ_JSON_ARRAY = re.compile(r"\brespond with a JSON array\b|\breturn a JSON array\b", re.IGNORECASE)
+_REQ_CSV       = re.compile(r"\breturn .*CSV\b|\bCSV with columns\b", re.IGNORECASE)
+_REQ_HTML      = re.compile(r"\bHTML table\b", re.IGNORECASE)
+_REQ_IMAGES    = re.compile(r"\b(base-?64|data uri|data:image/png)\b", re.IGNORECASE)
+
+def _parse_required_keys(q: str) -> List[str]:
+    m = _REQ_JSON_KEYS.search(q)
+    if not m:
+        return []
+    block = m.group(1)
+    keys = re.findall(r"`([^`]+)`|([A-Za-z0-9_]+)", block)
+    out = []
+    for a,b in keys:
+        k = (a or b).strip()
+        if k:
+            out.append(k)
+    return list(dict.fromkeys(out))
+
+def _expects_json_object(q: str) -> bool: return bool(_REQ_JSON_KEYS.search(q))
+def _expects_json_array(q: str)  -> bool: return bool(_REQ_JSON_ARRAY.search(q))
+def _expects_csv(q: str)         -> bool: return bool(_REQ_CSV.search(q))
+def _expects_html(q: str)        -> bool: return bool(_REQ_HTML.search(q))
+def _mentions_images(q: str)     -> bool: return bool(_REQ_IMAGES.search(q))
 
 async def validate_final_result(stdout_text: str) -> Dict[str, Any]:
     data = await coerce_json(stdout_text)
@@ -289,8 +306,44 @@ async def validate_final_result(stdout_text: str) -> Dict[str, Any]:
         raise ValueError("final_result.logs must be a list.")
     return data
 
+async def validate_against_question(question: str, final_result: Dict[str, Any]) -> Optional[str]:
+    ans = final_result.get("answer", None)
+    if ans is None:
+        return "final_result.answer is missing."
+
+    if _expects_json_array(question):
+        if not isinstance(ans, list):
+            return "Expected a JSON array in final_result.answer."
+    elif _expects_json_object(question):
+        if not isinstance(ans, dict):
+            return "Expected a JSON object in final_result.answer."
+        req_keys = _parse_required_keys(question)
+        if req_keys:
+            missing = [k for k in req_keys if k not in ans]
+            if missing:
+                return f"Missing required JSON keys in final_result.answer: {missing}"
+        if _mentions_images(question):
+            # enforce 100kB cap for any data URI inside answer
+            for k,v in ans.items():
+                if isinstance(v, str) and v.startswith("data:image/png;base64,"):
+                    try:
+                        b = base64.b64decode(v.split(",",1)[1], validate=False)
+                        if len(b) >= 100_000:
+                            return f"Image in key '{k}' exceeds 100kB ({len(b)} bytes). Reduce figure size/dpi."
+                    except Exception:
+                        return f"Image in key '{k}' is not valid base64 data URI."
+    elif _expects_csv(question):
+        if not isinstance(ans, str) or "," not in ans:
+            return "Expected CSV text in final_result.answer."
+    elif _expects_html(question):
+        low = (ans if isinstance(ans, str) else "").lower()
+        if "<table" not in low or "</table>" not in low:
+            return "Expected an HTML table in final_result.answer."
+    # Otherwise free-form format is acceptable
+    return None
+
 async def make_coder_prompt(plan: Plan) -> str:
-    schema_hint = """Internal final_result schema (for reliability):
+    schema_hint = """Internal final_result schema:
 {
   "answer": <any JSON-serializable>,
   "tables": { "<name>": [ {<record>}, ... ] },
@@ -300,7 +353,7 @@ async def make_coder_prompt(plan: Plan) -> str:
 """
     return (
         f"Original question:\n{plan.question}\n\n"
-        f"Plan JSON (no output format hints, no datasets):\n{plan.json(indent=2)}\n\n"
+        f"Plan JSON:\n{plan.json(indent=2)}\n\n"
         f"{schema_hint}\n"
         "Write the analysis code now."
     )
@@ -382,18 +435,19 @@ def load_dataframe_auto(name):
         if isinstance(js, list):
             return pd.DataFrame(js)
         if isinstance(js, dict):
-            return pd.json_normalize(js)
+            return pd.json_normalize(js, sep="_")
         raise ValueError("JSON not table-like")
     if low.endswith(".xlsx") or low.endswith(".xls"):
         return read_excel_attachment(name)
     if low.endswith(".parquet") or low.endswith(".pq"):
         return read_parquet_attachment(name)
+    # try generic CSV then JSON
     try:
         return read_csv_attachment(name)
     except Exception:
         try:
             js = read_json_attachment(name)
-            return pd.json_normalize(js) if isinstance(js, dict) else pd.DataFrame(js)
+            return pd.json_normalize(js, sep="_") if isinstance(js, dict) else pd.DataFrame(js)
         except Exception:
             raise ValueError(f"Unsupported tabular file: {{name}}")
 
@@ -415,7 +469,6 @@ async def analyze_question(
     request: Request,
     debug: int = Query(0, description="Set to 1 to include debug payloads (JSON)."),
 ):
-    print("analyze_question: got a request")
     if not LLM_API_KEY:
         raise HTTPException(status_code=500, detail="LLM_API_KEY/OPENAI_API_KEY is not set.")
 
@@ -491,7 +544,7 @@ async def analyze_question(
                         for a in file_blobs
                     ],
                     "observed_form_keys": seen_keys,
-                    "hint": "Upload at least one UTF-8 text file (e.g., .txt, .md, .json).",
+                    "hint": "Upload at least one UTF-8 text file (e.g., .txt, .md, .json) containing the question/instructions.",
                 },
             )
         raise HTTPException(
@@ -511,13 +564,13 @@ async def analyze_question(
 
     # === 2) Generate code ===
     coder_prompt = await make_coder_prompt(plan)
-    raw_code = await llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, attachments=file_blobs)
+    raw_code = await llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, temperature=0.1, attachments=file_blobs)
     generated_code = await extract_code(raw_code)
 
-    bad = await contains_dangerous_imports(generated_code)
+    bad = await contains_dangerous_imports(generated_code) or await contains_local_file_io(generated_code)
     if bad:
         dbg_prompt = await make_debugger_prompt(plan, generated_code, "", bad)
-        raw_fixed = await llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, attachments=file_blobs)
+        raw_fixed = await llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
         generated_code = await extract_code(raw_fixed)
 
     # === 3) Execute with retries + debugger (with async LLM calls) ===
@@ -529,7 +582,6 @@ async def analyze_question(
     final_structured: Optional[Dict[str, Any]] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
-        print("starting attempting...")
         to_run = await build_executable_source(last_code, file_blobs)
         stdout, stderr, returncode = await run_python_code(to_run)
         last_stdout, last_stderr = stdout, stderr
@@ -537,40 +589,54 @@ async def analyze_question(
         if returncode == 0:
             try:
                 final_structured = await validate_final_result(stdout.strip())
-                print("successful first try...")
+                # Requirement-aware validation (ensures base64 keys, CSV/HTML/JSON shapes, image size caps, etc.)
+                req_err = await validate_against_question(question, final_structured)
+                if req_err:
+                    raise ValueError(f"RequirementError: {req_err}")
                 break
             except Exception as ve:
                 if debug_attempts < 2:
                     dbg_prompt = await make_debugger_prompt(plan, last_code, stdout, f"ValidationError: {ve}")
-                    raw_fixed = await llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, attachments=file_blobs)
+                    raw_fixed = await llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
                     last_code = await extract_code(raw_fixed)
+                    # re-lint new code
+                    bad2 = await contains_dangerous_imports(last_code) or await contains_local_file_io(last_code)
+                    if bad2:
+                        # force another debugger pass immediately to remove local I/O / dangerous imports
+                        dbg_prompt2 = await make_debugger_prompt(plan, last_code, "", bad2)
+                        raw_fixed2 = await llm_call(DEBUGGER_SYSTEM, dbg_prompt2, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
+                        last_code = await extract_code(raw_fixed2)
                     debug_attempts += 1
                     continue
                 else:
-                    fresh_raw = await llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, attachments=file_blobs)
+                    fresh_raw = await llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, temperature=0.1, attachments=file_blobs)
                     fresh_code = await extract_code(fresh_raw)
-                    bad2 = await contains_dangerous_imports(fresh_code)
+                    bad2 = await contains_dangerous_imports(fresh_code) or await contains_local_file_io(fresh_code)
                     if bad2:
                         fix_prompt = await make_debugger_prompt(plan, fresh_code, "", bad2)
-                        fixed_fresh = await llm_call(DEBUGGER_SYSTEM, fix_prompt, DEBUGGER_MODEL, attachments=file_blobs)
+                        fixed_fresh = await llm_call(DEBUGGER_SYSTEM, fix_prompt, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
                         fresh_code = await extract_code(fixed_fresh)
                     last_code = fresh_code
                     continue
         else:
-            print("else try...")
             if debug_attempts < 2:
                 dbg_prompt = await make_debugger_prompt(plan, last_code, stdout, stderr)
-                raw_fixed = await llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, attachments=file_blobs)
+                raw_fixed = await llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
                 last_code = await extract_code(raw_fixed)
+                bad2 = await contains_dangerous_imports(last_code) or await contains_local_file_io(last_code)
+                if bad2:
+                    dbg_prompt2 = await make_debugger_prompt(plan, last_code, "", bad2)
+                    raw_fixed2 = await llm_call(DEBUGGER_SYSTEM, dbg_prompt2, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
+                    last_code = await extract_code(raw_fixed2)
                 debug_attempts += 1
                 continue
             else:
-                fresh_raw = await llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, attachments=file_blobs)
+                fresh_raw = await llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, temperature=0.1, attachments=file_blobs)
                 fresh_code = await extract_code(fresh_raw)
-                bad2 = await contains_dangerous_imports(fresh_code)
+                bad2 = await contains_dangerous_imports(fresh_code) or await contains_local_file_io(fresh_code)
                 if bad2:
                     fix_prompt = await make_debugger_prompt(plan, fresh_code, "", bad2)
-                    fixed_fresh = await llm_call(DEBUGGER_SYSTEM, fix_prompt, DEBUGGER_MODEL, attachments=file_blobs)
+                    fixed_fresh = await llm_call(DEBUGGER_SYSTEM, fix_prompt, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
                     fresh_code = await extract_code(fixed_fresh)
                 last_code = fresh_code
                 continue
@@ -602,7 +668,7 @@ async def analyze_question(
 
     # === 4) Format ===
     fmt_prompt = await make_formatter_prompt(question, final_structured)
-    formatted = await llm_call(OUTPUT_FORMATTER_SYSTEM, fmt_prompt, FORMATTER_MODEL, attachments=file_blobs)
+    formatted = await llm_call(OUTPUT_FORMATTER_SYSTEM, fmt_prompt, FORMATTER_MODEL, temperature=0.2, attachments=file_blobs)
 
     if debug == 1:
         return JSONResponse(
@@ -634,6 +700,34 @@ async def analyze_question(
 
     return Response(formatted, media_type="text/plain")
 
+# ---- Executor (sandbox) -----------------------------------------------------
+async def run_python_code(code: str, timeout: int = 120) -> Tuple[str, str, int]:
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(code)
+            temp_file = f.name
+
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, temp_file,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return stdout.decode(), stderr.decode(), proc.returncode
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return "", "Process timed out", -1
+        finally:
+            try:
+                os.unlink(temp_file)
+            except Exception:
+                pass
+    except Exception as e:
+        return "", f"Execution error: {str(e)}", -1
+
+# ---- Health / Root ----------------------------------------------------------
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
@@ -641,11 +735,14 @@ async def health_check():
 @app.get("/")
 async def root():
     return {
-        "message": "Universal Data Analyst API v3 (no explicit output type / no datasets in plan)",
-        "usage": "curl -s -X POST 'http://localhost:8000/api/?debug=1' -F 'file=@question.txt'",
+        "message": "Universal Data Analyst API v4 (robust, format-aware, attachment-first, web-helper only)",
+        "usage": "curl -s -X POST 'http://localhost:8000/api/?debug=1' -F 'questions.txt=@question.txt' -F 'other_files...'",
         "notes": [
-            "The planner never specifies output format or datasets.",
-            "The coder produces a reliable JSON object internally.",
-            "The formatter infers the outward format from the question and returns plain text."
+            "The planner extracts format requirements (JSON/CSV/HTML/images) directly from the question.",
+            "The coder uses only attachment/web helper functions; local file paths are lint-blocked.",
+            "A requirement-aware validator forces exact outward format (keys, arrays, CSV/HTML) and image size caps.",
+            "The formatter passes through exact requested formats instead of inventing fields.",
+            "Temperatures tuned low for consistency on gpt-4o-mini."
         ]
     }
+
