@@ -6,27 +6,27 @@ import tempfile
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-from  fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
 import base64
-from fastapi.responses import JSONResponse,Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ValidationError
 
-# ---- LLM client (OpenAI-compatible) -----------------------------------------
-from openai import OpenAI
+# ---- LLM client (OpenAI-compatible, async) ----------------------------------
+from openai import AsyncOpenAI
 
 LLM_API_KEY = os.getenv("OPENAI_API_KEY")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-PLANNER_MODEL = os.getenv("LLM_PLANNER_MODEL", "gpt-5-mini")
-CODER_MODEL = os.getenv("LLM_CODER_MODEL", "gpt-5-mini")
-DEBUGGER_MODEL = os.getenv("LLM_DEBUGGER_MODEL", "gpt-5-mini")
-INTERPRETER_MODEL = os.getenv("LLM_INTERPRETER_MODEL", "gpt-5-mini")
-FORMATTER_MODEL = os.getenv("LLM_INTERPRETER_MODEL", "gpt-5-mini")
+LLM_BASE_URL = "https://api.openai.com/v1"
+PLANNER_MODEL ="gpt-4o-mini"
+CODER_MODEL = "gpt-4o-mini"
+DEBUGGER_MODEL = "gpt-4o-mini"
+INTERPRETER_MODEL = "gpt-4o-mini"
+FORMATTER_MODEL = "gpt-4o-mini"
 
 if not LLM_API_KEY:
     # You can still run /health and / endpoints; /api/ will error clearly.
     pass
 
-client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
 app = FastAPI(title="Universal Data Analyst (no explicit format/datasets)", version="3.0.0")
 
@@ -96,8 +96,6 @@ Return ONLY corrected Python code that:
 No commentary. Code only.
 """
 
-# The formatter infers the desired outward representation from the user question.
-# It must return a SINGLE string (no code fences). It may choose CSV/JSON text/Markdown/HTML/data URI/etc.
 OUTPUT_FORMATTER_SYSTEM = """You are an output formatter.
 Goal: Given the original user question and a JSON object `final_result` (with fields answer/tables/images/logs),
 produce a SINGLE plain-text string that matches the output/reponse format explicitly requested by the question.
@@ -175,12 +173,12 @@ REQUIRED_FINAL_KEYS = {"answer", "tables", "images", "logs"}
 # ---- Utilities ---------------------------------------------------------------
 _CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*([\s\S]*?)```", re.IGNORECASE)
 
-def extract_code(text: str) -> str:
+async def extract_code(text: str) -> str:
     m = _CODE_FENCE_RE.search(text)
     code = m.group(1) if m else text
     return code.strip()
 
-def coerce_json(text: str) -> Dict[str, Any]:
+async def coerce_json(text: str) -> Dict[str, Any]:
     text = text.strip()
     try:
         return json.loads(text)
@@ -192,7 +190,7 @@ def coerce_json(text: str) -> Dict[str, Any]:
             return json.loads(snippet)
         raise
 
-def llm_call(
+async def llm_call(
     system_prompt: str,
     user_prompt: str,
     model: str,
@@ -202,8 +200,6 @@ def llm_call(
     if not LLM_API_KEY:
         raise HTTPException(status_code=500, detail="LLM_API_KEY/OPENAI_API_KEY is not set.")
 
-    # Append attachments as JSON to the user content (simple, transport-agnostic).
-    # If you later support real file uploads to your provider, map them here instead.
     if attachments:
         attach_block = json.dumps(
             [{"filename": a.get("filename"),
@@ -216,7 +212,7 @@ def llm_call(
     else:
         user_content = user_prompt
 
-    resp = client.chat.completions.create(
+    resp = await client.chat.completions.create(
         model=model,
         temperature=temperature,
         messages=[
@@ -226,24 +222,23 @@ def llm_call(
     )
     return resp.choices[0].message.content.strip()
 
-def plan_question(question: str) -> Plan:
-    out = llm_call(PLANNER_SYSTEM, question, PLANNER_MODEL)
+async def plan_question(question: str) -> Plan:
+    out = await llm_call(PLANNER_SYSTEM, question, PLANNER_MODEL)
     try:
-        data = coerce_json(out)
+        data = await coerce_json(out)
         return Plan(**data)
     except Exception:
-        # Re-ask with stronger instruction
         question2 = question + "\n\nReturn VALID JSON only. No commentary."
-        out2 = llm_call(PLANNER_SYSTEM, question2, PLANNER_MODEL)
-        data2 = coerce_json(out2)
+        out2 = await llm_call(PLANNER_SYSTEM, question2, PLANNER_MODEL)
+        data2 = await coerce_json(out2)
         return Plan(**data2)
 
 DANGEROUS_IMPORTS = {
     "subprocess","os","sys","shutil","socket","pathlib","multiprocessing",
-    "asyncio","http.server","flask","fastapi","uvicorn","openai","shlex","pexpect"
+    "asyncio","http.server","flask","fastapi","openai","shlex","pexpect","uvicorn"
 }
 
-def contains_dangerous_imports(code: str) -> Optional[str]:
+async def contains_dangerous_imports(code: str) -> Optional[str]:
     lines = code.splitlines()
     for i, ln in enumerate(lines, 1):
         s = ln.strip()
@@ -279,8 +274,8 @@ async def run_python_code(code: str, timeout: int = 120) -> Tuple[str, str, int]
     except Exception as e:
         return "", f"Execution error: {str(e)}", -1
 
-def validate_final_result(stdout_text: str) -> Dict[str, Any]:
-    data = coerce_json(stdout_text)
+async def validate_final_result(stdout_text: str) -> Dict[str, Any]:
+    data = await coerce_json(stdout_text)
     if not isinstance(data, dict):
         raise ValueError("Output is not a JSON object.")
     missing = REQUIRED_FINAL_KEYS - set(data.keys())
@@ -294,7 +289,7 @@ def validate_final_result(stdout_text: str) -> Dict[str, Any]:
         raise ValueError("final_result.logs must be a list.")
     return data
 
-def make_coder_prompt(plan: Plan) -> str:
+async def make_coder_prompt(plan: Plan) -> str:
     schema_hint = """Internal final_result schema (for reliability):
 {
   "answer": <any JSON-serializable>,
@@ -310,7 +305,7 @@ def make_coder_prompt(plan: Plan) -> str:
         "Write the analysis code now."
     )
 
-def make_debugger_prompt(plan: Plan, prev_code: str, stdout_text: str, stderr_text: str) -> str:
+async def make_debugger_prompt(plan: Plan, prev_code: str, stdout_text: str, stderr_text: str) -> str:
     s_out = stdout_text[-2000:]
     s_err = stderr_text[-2000:]
     s_code = prev_code[-4000:]
@@ -326,7 +321,7 @@ def make_debugger_prompt(plan: Plan, prev_code: str, stdout_text: str, stderr_te
         + "\n\nPlease return corrected Python code only."
     )
 
-def build_executable_source(generated_code: str, attachments: List[Dict[str, Any]]) -> str:
+async def build_executable_source(generated_code: str, attachments: List[Dict[str, Any]]) -> str:
     attachments_py_json = json.dumps(attachments, separators=(",", ":"))
     prelude = f"""
 ATTACHMENTS = {attachments_py_json}
@@ -407,8 +402,7 @@ def is_image_name(name):
 """
     return HELPERS + "\n" + prelude + "\n" + generated_code + "\n"
 
-
-def make_formatter_prompt(question: str, final_result: Dict[str, Any]) -> str:
+async def make_formatter_prompt(question: str, final_result: Dict[str, Any]) -> str:
     payload = {
         "question": question,
         "final_result": final_result,
@@ -421,6 +415,7 @@ async def analyze_question(
     request: Request,
     debug: int = Query(0, description="Set to 1 to include debug payloads (JSON)."),
 ):
+    print("analyze_question: got a request")
     if not LLM_API_KEY:
         raise HTTPException(status_code=500, detail="LLM_API_KEY/OPENAI_API_KEY is not set.")
 
@@ -429,14 +424,10 @@ async def analyze_question(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid multipart form: {e}")
 
-    # Keep track of what we actually saw for better debug messages
     seen_keys = list(form.keys())
 
-    # Collect ALL UploadFile values under ANY key (supports repeated keys too)
     files: List[UploadFile] = []
-    # form.multi_items() iterates every (key, value), including duplicates
     for key, value in form.multi_items():
-        # Be robust about the class origin (FastAPI vs Starlette)
         if hasattr(value, "filename") and hasattr(value, "read"):
             files.append(value)
 
@@ -454,12 +445,10 @@ async def analyze_question(
             )
         raise HTTPException(status_code=400, detail="No files uploaded")
 
-    # Helper: read bytes safely
     async def read_bytes(f: UploadFile) -> bytes:
         return await f.read()
 
-    # Helper: identify a text-like payload (prefer content-type, fallback to utf-8 decode test)
-    def is_text_like(upload: UploadFile, data: bytes) -> bool:
+    async def is_text_like(upload: UploadFile, data: bytes) -> bool:
         ct = (getattr(upload, "content_type", "") or "").lower()
         if ct.startswith("text/") or ct in {"application/json", "application/xml"}:
             return True
@@ -469,7 +458,6 @@ async def analyze_question(
         except UnicodeDecodeError:
             return False
 
-    # Read all files once; build attachments for the LLM
     file_blobs: List[Dict[str, Any]] = []
     first_text_payload: Optional[str] = None
     first_text_filename: Optional[str] = None
@@ -484,7 +472,7 @@ async def analyze_question(
             "size": len(blob),
         })
 
-        if first_text_payload is None and is_text_like(f, blob):
+        if first_text_payload is None and await is_text_like(f, blob):
             try:
                 first_text_payload = blob.decode("utf-8").strip()
                 first_text_filename = f.filename
@@ -512,28 +500,28 @@ async def analyze_question(
         )
 
     question = first_text_payload
+
     # === 1) Plan ===
     try:
-        plan = plan_question(question)
+        plan = await plan_question(question)
     except ValidationError as ve:
         raise HTTPException(status_code=500, detail=f"Planner JSON invalid: {ve}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Planner failed: {e}")
 
     # === 2) Generate code ===
-    coder_prompt = make_coder_prompt(plan)
-    raw_code = llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, attachments=file_blobs)
-    generated_code = extract_code(raw_code)
+    coder_prompt = await make_coder_prompt(plan)
+    raw_code = await llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, attachments=file_blobs)
+    generated_code = await extract_code(raw_code)
 
-    bad = contains_dangerous_imports(generated_code)
+    bad = await contains_dangerous_imports(generated_code)
     if bad:
-        dbg_prompt = make_debugger_prompt(plan, generated_code, "", bad)
-        raw_fixed = llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, attachments=file_blobs)
-        generated_code = extract_code(raw_fixed)
+        dbg_prompt = await make_debugger_prompt(plan, generated_code, "", bad)
+        raw_fixed = await llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, attachments=file_blobs)
+        generated_code = await extract_code(raw_fixed)
 
-    # === 3) Execute with retries + debugger ===
-    # Modified: After two debugger retries, fall back to requesting fresh code.
-    MAX_RETRIES = 4  # allow room for two debugger attempts + one fresh-code attempt
+    # === 3) Execute with retries + debugger (with async LLM calls) ===
+    MAX_RETRIES = 4
     debug_attempts = 0
     last_stdout = ""
     last_stderr = ""
@@ -541,48 +529,49 @@ async def analyze_question(
     final_structured: Optional[Dict[str, Any]] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
-        to_run = build_executable_source(last_code,file_blobs)
+        print("starting attempting...")
+        to_run = await build_executable_source(last_code, file_blobs)
         stdout, stderr, returncode = await run_python_code(to_run)
         last_stdout, last_stderr = stdout, stderr
 
         if returncode == 0:
             try:
-                final_structured = validate_final_result(stdout.strip())
+                final_structured = await validate_final_result(stdout.strip())
+                print("successful first try...")
                 break
             except Exception as ve:
                 if debug_attempts < 2:
-                    dbg_prompt = make_debugger_prompt(plan, last_code, stdout, f"ValidationError: {ve}")
-                    raw_fixed = llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, attachments=file_blobs)
-                    last_code = extract_code(raw_fixed)
+                    dbg_prompt = await make_debugger_prompt(plan, last_code, stdout, f"ValidationError: {ve}")
+                    raw_fixed = await llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, attachments=file_blobs)
+                    last_code = await extract_code(raw_fixed)
                     debug_attempts += 1
                     continue
                 else:
-                    # Fresh code path after two debugger retries
-                    fresh_raw = llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, attachments=file_blobs)
-                    fresh_code = extract_code(fresh_raw)
-                    bad2 = contains_dangerous_imports(fresh_code)
+                    fresh_raw = await llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, attachments=file_blobs)
+                    fresh_code = await extract_code(fresh_raw)
+                    bad2 = await contains_dangerous_imports(fresh_code)
                     if bad2:
-                        fix_prompt = make_debugger_prompt(plan, fresh_code, "", bad2)
-                        fixed_fresh = llm_call(DEBUGGER_SYSTEM, fix_prompt, DEBUGGER_MODEL, attachments=file_blobs)
-                        fresh_code = extract_code(fixed_fresh)
+                        fix_prompt = await make_debugger_prompt(plan, fresh_code, "", bad2)
+                        fixed_fresh = await llm_call(DEBUGGER_SYSTEM, fix_prompt, DEBUGGER_MODEL, attachments=file_blobs)
+                        fresh_code = await extract_code(fixed_fresh)
                     last_code = fresh_code
                     continue
         else:
+            print("else try...")
             if debug_attempts < 2:
-                dbg_prompt = make_debugger_prompt(plan, last_code, stdout, stderr)
-                raw_fixed = llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, attachments=file_blobs)
-                last_code = extract_code(raw_fixed)
+                dbg_prompt = await make_debugger_prompt(plan, last_code, stdout, stderr)
+                raw_fixed = await llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, attachments=file_blobs)
+                last_code = await extract_code(raw_fixed)
                 debug_attempts += 1
                 continue
             else:
-                # Fresh code path after two debugger retries
-                fresh_raw = llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, attachments=file_blobs)
-                fresh_code = extract_code(fresh_raw)
-                bad2 = contains_dangerous_imports(fresh_code)
+                fresh_raw = await llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, attachments=file_blobs)
+                fresh_code = await extract_code(fresh_raw)
+                bad2 = await contains_dangerous_imports(fresh_code)
                 if bad2:
-                    fix_prompt = make_debugger_prompt(plan, fresh_code, "", bad2)
-                    fixed_fresh = llm_call(DEBUGGER_SYSTEM, fix_prompt, DEBUGGER_MODEL, attachments=file_blobs)
-                    fresh_code = extract_code(fixed_fresh)
+                    fix_prompt = await make_debugger_prompt(plan, fresh_code, "", bad2)
+                    fixed_fresh = await llm_call(DEBUGGER_SYSTEM, fix_prompt, DEBUGGER_MODEL, attachments=file_blobs)
+                    fresh_code = await extract_code(fixed_fresh)
                 last_code = fresh_code
                 continue
 
@@ -612,8 +601,8 @@ async def analyze_question(
         )
 
     # === 4) Format ===
-    fmt_prompt = make_formatter_prompt(question, final_structured)
-    formatted = llm_call(OUTPUT_FORMATTER_SYSTEM, fmt_prompt, FORMATTER_MODEL, attachments=file_blobs)
+    fmt_prompt = await make_formatter_prompt(question, final_structured)
+    formatted = await llm_call(OUTPUT_FORMATTER_SYSTEM, fmt_prompt, FORMATTER_MODEL, attachments=file_blobs)
 
     if debug == 1:
         return JSONResponse(
