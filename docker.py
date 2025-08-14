@@ -4,106 +4,138 @@ import json
 import asyncio
 import tempfile
 import sys
+import io
 from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
-import base64
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, Field
 
-# ---- LLM client (OpenAI-compatible, async) ----------------------------------
-from openai import AsyncOpenAI
+# ---- LLM client (OpenAI-compatible) -----------------------------------------
+from openai import OpenAI
 
 LLM_API_KEY = os.getenv("OPENAI_API_KEY")
-LLM_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
 
-# Use one family only, but keep roles separated for temperature control
-PLANNER_MODEL ="gpt-4o-mini"
-CODER_MODEL = "gpt-4o-mini"
-DEBUGGER_MODEL = "gpt-4o-mini"
-FORMATTER_MODEL = "gpt-4o-mini"
+# Defaults tuned for small models; override via env
+PLANNER_MODEL    = os.getenv("LLM_PLANNER_MODEL",    "gpt-4o-mini")
+CODER_MODEL      = os.getenv("LLM_CODER_MODEL",      "gpt-4o-mini")
+FORMATTER_MODEL  = os.getenv("LLM_FORMATTER_MODEL",  "gpt-4o-mini")
 
-client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+if not LLM_API_KEY:
+    # /health and / will work; /api will return a clear error.
+    pass
+client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
-app = FastAPI(title="Universal Data Analyst (robust, format-aware)", version="4.0.0")
+app = FastAPI(title="Universal Data Analyst (speed-optimized)", version="4.2.0")
 
 # ---- Prompts ----------------------------------------------------------------
+# Simplified planner for faster processing
 PLANNER_SYSTEM = """You are a planning engine. Output STRICT JSON that validates this schema:
+
 {
   "type": "object",
   "properties": {
     "question": { "type": "string" },
     "parameters": { "type": "object" },
     "steps": { "type": "array", "items": { "type": "string" } },
-    "final_variables": { "type": "array", "items": { "type": "string" } },
-    "requirements": {
-      "type": "object",
-      "properties": {
-        "expected_format": { "type": "string", "enum": ["markdown","json_object","json_array","csv","html_table","images_only","text"] },
-        "required_keys": { "type": "array", "items": { "type": "string" } },
-        "size_constraints": { "type": "object" }
-      },
-      "required": ["expected_format"]
-    }
+    "final_variables": { "type": "array", "items": { "type": "string" } }
   },
-  "required": ["question", "parameters", "steps", "final_variables", "requirements"],
+  "required": ["question", "parameters", "steps", "final_variables"],
   "additionalProperties": false
 }
-Derive `requirements` only from the question text. Return JSON only. No prose, no hints.
-"""
 
-CODER_SYSTEM = """Write ONLY Python code. No comments. Do not print anything except one final print(json.dumps(final_result)).
+Keep steps minimal (max 3). Return JSON only. No commentary."""
 
-You must:
-- Discover and load inputs from attachments using: list_attachments(), load_dataframe_auto(), read_*_attachment(), is_image_name().
-- Never read local files by path. Never call pandas read_* with a filename string. Local files do not exist.
-- For web data: use fetch_text() and read_table_html(). Do not import or use requests/urllib/BeautifulSoup directly; helpers already exist.
-- When parsing HTML tables: call read_table_html(html). Select the most relevant/largest table. If columns are MultiIndex, flatten them. Strip $, %, and commas before numeric ops; use pandas to_numeric(errors="coerce").
-- When computing stats/correlation: coerce to numeric with errors='coerce' and dropna.
-- When plotting: use matplotlib.pyplot only. Create small figures (e.g., figsize=(4.8,3.2), dpi<=100) so base64 PNGs stay <100kB when required. Convert with fig_to_data_uri(fig).
-- If the question asks for specific image keys (e.g., temp_line_chart), include those keys INSIDE final_result['answer'] as data URIs.
-- If the question asks for CSV/HTML/JSON array/object, set final_result['answer'] to exactly that type and schema.
+# Streamlined coder prompt for faster generation
+CODER_SYSTEM = """You write ONLY STRICT JSON analysis specs. Be concise and efficient.
 
-Contract to print:
-final_result = {
-  "answer": <any JSON-serializable value that satisfies the user's requested outward format>,
-  "tables": { "<name>": [ {<record>}, ... ] },
-  "images": [ "data:image/png;base64,...", ... ],
-  "logs": [ "string messages with dataset shapes, sanity checks, etc." ]
+Schema (must validate exactly):
+{
+  "type": "object",
+  "properties": {
+    "inputs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type":"string"},
+          "source": {"type":"string", "enum": ["html","csv","json","inline"]},
+          "url": {"type":["string","null"]},
+          "data": {"type":["string","object","array","null"]},
+          "table_index": {"type":["integer","null"]}
+        },
+        "required": ["name","source"],
+        "additionalProperties": false
+      }
+    },
+    "transforms": {
+      "type": "array",
+      "items": {
+        "type":"object",
+        "properties": {
+          "target": {"type":"string"},
+          "op": {"type":"string", "enum": [
+            "select_columns","rename","dropna","head","sort_values",
+            "filter_query","groupby_agg","join","add_column","parse_dates"
+          ]},
+          "args": {"type":"object"}
+        },
+        "required": ["target","op","args"],
+        "additionalProperties": false
+      }
+    },
+    "charts": {
+      "type":"array",
+      "items":{
+        "type":"object",
+        "properties": {
+          "table": {"type":"string"},
+          "kind": {"type":"string","enum":["line","bar","scatter","hist"]},
+          "x": {"type":["string","null"]},
+          "y": {"type":["string","array","null"]},
+          "title": {"type":["string","null"]},
+          "bins": {"type":["integer","null"]}
+        },
+        "required": ["table","kind"],
+        "additionalProperties": false
+      }
+    },
+    "answer": {
+      "type":"object",
+      "properties": {
+        "type": {"type":"string","enum":["text_summary","basic_stats","none"]},
+        "table": {"type":["string","null"]},
+        "columns": {"type":["array","null"], "items":{"type":"string"}}
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+    "result_table": {"type":"string"}
+  },
+  "required": ["inputs","transforms","charts","answer","result_table"],
+  "additionalProperties": false
 }
 
-Allowed imports: json, math, statistics, re, datetime, io, base64, pandas as pd, numpy as np, matplotlib.pyplot as plt.
+Minimize transforms. Prefer simple operations. Return JSON only."""
 
-End with: print(json.dumps(final_result))"""
-
-DEBUGGER_SYSTEM = """You are a precise code fixer.
-
-Given:
-- A plan (JSON)
-- The previous code
-- Its stderr and stdout
-- The required output contract (final_result as JSON printed once)
-
-Return ONLY corrected Python code that:
-- Loads data ONLY via provided attachment helpers or fetch_text/read_table_html
-- Does NOT use local file paths or direct requests/urllib/bs4
-- Ensures final_result['answer'] EXACTLY matches the requested outward format and includes any required base64 images under the specified keys
-- Keeps PNGs reasonably small (figure size/dpi) when size limits are mentioned
-- Prints exactly one line: json.dumps(final_result)
-- Produces valid JSON per the contract
-
-No commentary. Code only."""
-
-OUTPUT_FORMATTER_SYSTEM = """You are an output formatter.
-Goal: Given the original user question and JSON `final_result`, output a SINGLE plain-text string matching the exact format requested by the question.
+# Simplified formatter for speed — respects requested output format
+OUTPUT_FORMATTER_SYSTEM = """
+Your task is to produce the final result in the exact format requested by the user.
 
 Rules:
-- If the question specifies a concrete structure (e.g., JSON object/array with required keys, CSV with specific columns, HTML table, or base64-encoded images under named keys), output EXACTLY that using final_result['answer'] as the source of truth. Do not invent or omit keys.
-- Otherwise, produce a short Markdown report from final_result.
+- Read the user request carefully and identify any explicit or implicit output format or schema, no matter what it is called or how it is described.
+- Follow that format or schema exactly, including structure, syntax, spacing, and punctuation.
+- If the user describes the format in words, deduce and apply it precisely.
+- Do not add extra explanations, headers, or commentary outside the requested format.
+- If no format is specified at all, default to concise plain text.
+- Always return a single string as the final output.
+"""
 
-Output ONE string only. No code fences or extra commentary."""
 
-# ---- Helper code injected into the execution sandbox ------------------------
+# ---- Helper code (optimized for speed) --------------------------------------
 HELPERS = r"""
 import json, base64, io, time, math, statistics, re, datetime
 import requests, pandas as pd
@@ -111,7 +143,7 @@ from bs4 import BeautifulSoup
 import numpy as np
 import matplotlib.pyplot as plt
 
-def fetch_text(url, timeout=20, retries=2):
+def fetch_text(url, timeout=8, retries=1):
     last = None
     headers = {"User-Agent": "Mozilla/5.0 (compatible; UDA/4.0)"}
     for _ in range(retries+1):
@@ -121,10 +153,11 @@ def fetch_text(url, timeout=20, retries=2):
             return r.text
         except Exception as e:
             last = e
-            time.sleep(1)
+            if _ < retries:
+                time.sleep(0.5)  # Reduced sleep
     raise last
 
-def fetch_json(url, timeout=20):
+def fetch_json(url, timeout=8):
     headers = {"User-Agent": "Mozilla/5.0 (compatible; UDA/4.0)"}
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
@@ -140,7 +173,7 @@ def read_table_html(html):
         if not tables:
             return []
         out = []
-        for t in tables:
+        for t in tables[:3]:  # Limit to first 3 tables for speed
             try:
                 out.append(pd.read_html(str(t))[0])
             except Exception:
@@ -153,7 +186,7 @@ def df_to_records(df):
 def fig_to_data_uri(fig):
     import io, base64
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=fig.dpi if hasattr(fig, "dpi") else 100)
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=72)  # Lower DPI for speed
     plt.close(fig)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 """
@@ -164,19 +197,50 @@ class Plan(BaseModel):
     parameters: Dict[str, Any]
     steps: List[str]
     final_variables: List[str]
-    requirements: Dict[str, Any]
 
 REQUIRED_FINAL_KEYS = {"answer", "tables", "images", "logs"}
 
+class AnalysisInput(BaseModel):
+    name: str
+    source: str  # "html" | "csv" | "json" | "inline"
+    url: Optional[str] = None
+    data: Optional[Any] = None
+    table_index: Optional[int] = None
+
+class Transform(BaseModel):
+    target: str
+    op: str
+    args: Dict[str, Any]
+
+class ChartSpec(BaseModel):
+    table: str
+    kind: str
+    x: Optional[str] = None
+    y: Optional[Any] = None
+    title: Optional[str] = None
+    bins: Optional[int] = None
+
+class AnswerSpec(BaseModel):
+    type: str  # "text_summary" | "basic_stats" | "none"
+    table: Optional[str] = None
+    columns: Optional[List[str]] = None
+
+class AnalysisSpec(BaseModel):
+    inputs: List[AnalysisInput]
+    transforms: List[Transform]
+    charts: List[ChartSpec]
+    answer: AnswerSpec
+    result_table: str
+
 # ---- Utilities ---------------------------------------------------------------
-_CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*([\s\S]*?)```", re.IGNORECASE)
+_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
-async def extract_code(text: str) -> str:
+def extract_payload(text: str) -> str:
     m = _CODE_FENCE_RE.search(text)
-    code = m.group(1) if m else text
-    return code.strip()
+    payload = m.group(1) if m else text
+    return payload.strip()
 
-async def coerce_json(text: str) -> Dict[str, Any]:
+def coerce_json(text: str) -> Dict[str, Any]:
     text = text.strip()
     try:
         return json.loads(text)
@@ -188,290 +252,666 @@ async def coerce_json(text: str) -> Dict[str, Any]:
             return json.loads(snippet)
         raise
 
-async def llm_call(
-    system_prompt: str,
-    user_prompt: str,
-    model: str,
-    temperature: float = 1,
-    attachments: Optional[List[Dict[str, Any]]] = None,
-) -> str:
+# Optimized LLM call with shorter timeouts and aggressive JSON mode
+def llm_call_raw(system_prompt: str, user_prompt: str, model: str, temperature: float = 0, max_tokens: int = 1000) -> str:
     if not LLM_API_KEY:
-        raise HTTPException(status_code=500, detail="LLM_API_KEY/OPENAI_API_KEY is not set.")
-
-    if attachments:
-        attach_block = json.dumps(
-            [{"filename": a.get("filename"),
-              "content_type": a.get("content_type"),
-              "size": a.get("size"),
-              "data_b64": a.get("data_b64")} for a in attachments],
-            separators=(",", ":")
-        )
-        user_content = f"{user_prompt}\n\n[ATTACHMENTS_JSON]\n{attach_block}"
-    else:
-        user_content = user_prompt
-
-    resp = await client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-    )
-    return resp.choices[0].message.content.strip()
-
-async def plan_question(question: str) -> Plan:
-    out = await llm_call(PLANNER_SYSTEM, question, PLANNER_MODEL, temperature=0.2)
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY/LLM_API_KEY is not set.")
+    
     try:
-        data = await coerce_json(out)
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,  # Limit tokens for speed
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        # Fallback without JSON mode
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+
+# Async LLM call for parallel processing
+async def llm_call_async(system_prompt: str, user_prompt: str, model: str, temperature: float = 0, max_tokens: int = 1000) -> str:
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor() as executor:
+        return await loop.run_in_executor(
+            executor, 
+            llm_call_raw, 
+            system_prompt, user_prompt, model, temperature, max_tokens
+        )
+
+# Fast planning with reduced retries
+def plan_question(question: str) -> Plan:
+    out = llm_call_raw(PLANNER_SYSTEM, question, PLANNER_MODEL, temperature=0, max_tokens=500)
+    try:
+        data = coerce_json(extract_payload(out))
         return Plan(**data)
     except Exception:
-        question2 = question + "\n\nReturn VALID JSON only. No commentary."
-        out2 = await llm_call(PLANNER_SYSTEM, question2, PLANNER_MODEL, temperature=0.2)
-        data2 = await coerce_json(out2)
+        # Single retry only
+        out2 = llm_call_raw(PLANNER_SYSTEM + "\n\nFAST MODE: Return minimal valid JSON.", question, PLANNER_MODEL, temperature=0, max_tokens=500)
+        data2 = coerce_json(extract_payload(out2))
         return Plan(**data2)
 
-DANGEROUS_IMPORTS = {
-    "subprocess","os","sys","shutil","socket","pathlib","multiprocessing",
-    "asyncio","http.server","flask","fastapi","openai","shlex","pexpect","uvicorn",
-    "requests","urllib","selenium","bs4","BeautifulSoup"
+# ---- Speed-optimized spec generation ----------------------------------------
+def make_coder_prompt(plan: Plan, attachments_summary: str, debug_hint: Optional[str]=None) -> str:
+    hint = f"\nDEBUG_HINT: {debug_hint}" if debug_hint else ""
+    return (
+        f"Question: {plan.question}\n"
+        f"Plan: {plan.model_dump_json()}\n"
+        f"Attachments available (prefer using them with source='inline' and their table names):\n{attachments_summary}\n"
+        "When referencing attachments, set inputs[].source='inline' and inputs[].data to a SMALL sample (we will provide full data at execution time)."
+        f"{hint}\n"
+        "Return analysis_spec JSON. Be minimal and efficient."
+    )
+
+# Single-shot spec generation (no best-of-N for speed)
+def generate_analysis_spec(plan: Plan, attachments_summary: str, debug_hint: Optional[str]=None) -> AnalysisSpec:
+    raw = llm_call_raw(
+        CODER_SYSTEM,
+        make_coder_prompt(plan, attachments_summary, debug_hint),
+        CODER_MODEL,
+        temperature=0,
+        max_tokens=800
+    )
+    
+    try:
+        data = coerce_json(extract_payload(raw))
+        return AnalysisSpec(**data)
+    except Exception:
+        # Single retry with stricter prompt
+        fixer_prompt = f"Fix to valid JSON schema:\n{raw}\n\nReturn only valid JSON."
+        fixed = llm_call_raw(CODER_SYSTEM, fixer_prompt, CODER_MODEL, temperature=0, max_tokens=800)
+        data2 = coerce_json(extract_payload(fixed))
+        return AnalysisSpec(**data2)
+
+# ---- Attachment ingestion & helpers -----------------------------------------
+TEXT_EXTS = {".txt", ".md", ".rst"}
+TABULAR_EXTS = {".csv", ".tsv", ".json", ".ndjson", ".parquet", ".pq", ".feather", ".xlsx", ".xls"}
+HTML_EXTS = {".html", ".htm"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+
+def _is_probably_text(content: bytes) -> bool:
+    if not content:
+        return False
+    # Heuristic: if >90% printable (incl. whitespace), treat as text
+    try:
+        decoded = content.decode("utf-8", errors="ignore")
+    except Exception:
+        return False
+    printable = sum(ch.isprintable() or ch in "\r\n\t" for ch in decoded)
+    return (printable / max(1, len(decoded))) > 0.9
+
+def _sanitize_name(name: str) -> str:
+    stem = Path(name).stem
+    cleaned = re.sub(r"[^0-9a-zA-Z_]+", "_", stem).strip("_")
+    return cleaned or "table"
+
+class AttachmentPreview(BaseModel):
+    name: str
+    table_name: Optional[str] = None
+    kind: str  # 'csv','json','parquet','excel','html','image','text','unknown'
+    sample_text: Optional[str] = None
+    sample_records: Optional[List[Dict[str, Any]]] = None
+    shape: Optional[Tuple[int, int]] = None
+    columns: Optional[List[str]] = None
+
+def _read_tabular_to_df(name: str, data: bytes, content_type: Optional[str]) -> Tuple[str, Optional[List[Dict[str, Any]]], Optional[Tuple[int,int]], Optional[List[str]]]:
+    import pandas as pd
+    ext = Path(name).suffix.lower()
+    buf = io.BytesIO(data)
+    df = None
+    if ext in {".csv", ".tsv"}:
+        sep = "\t" if ext == ".tsv" else ","
+        df = pd.read_csv(buf, sep=sep)
+    elif ext in {".json", ".ndjson"}:
+        try:
+            text = data.decode("utf-8")
+            # try ndjson first
+            if "\n" in text and text.strip().startswith("{") and text.strip().endswith("}"):
+                df = pd.read_json(io.StringIO(text), lines=True)
+            else:
+                j = json.loads(text)
+                df = pd.json_normalize(j)
+        except Exception:
+            df = pd.read_json(buf, lines=True)
+    elif ext in {".parquet", ".pq", ".feather"}:
+        df = pd.read_parquet(buf)
+    elif ext in {".xlsx", ".xls"}:
+        df = pd.read_excel(buf)
+    else:
+        # last resort: try csv
+        try:
+            df = pd.read_csv(io.BytesIO(data))
+        except Exception:
+            df = None
+    if df is None:
+        return "unknown", None, None, None
+    df = df.head(1000)
+    return "tabular", df_to_records(df.head(50)), df.shape, list(df.columns)[:50]
+
+def build_attachment_previews(files: List[UploadFile]) -> Tuple[Optional[str], List[AttachmentPreview]]:
+    """
+    Returns (question_text, previews)
+    - Detect question file automatically (filename contains 'question'/'questions'/'prompt' OR small text-like).
+    - The rest are attachments.
+    """
+    question_text: Optional[str] = None
+    previews: List[AttachmentPreview] = []
+
+    # Read all files into memory once
+    loaded: List[Tuple[UploadFile, bytes]] = []
+    for f in files:
+        content = f.file.read()
+        f.file.seek(0)
+        loaded.append((f, content))
+
+    # Heuristics to pick question
+    candidates = []
+    for f, b in loaded:
+        name = (f.filename or "").lower()
+        ext = Path(name).suffix.lower()
+        if any(k in name for k in ("question", "questions", "prompt")) and _is_probably_text(b):
+            candidates.append((0, f, b))  # strongest signal
+        elif ext in TEXT_EXTS and len(b) <= 256_000 and _is_probably_text(b):
+            candidates.append((1, f, b))
+        elif _is_probably_text(b) and len(b) <= 128_000:
+            candidates.append((2, f, b))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        _, fq, bq = candidates[0]
+        try:
+            question_text = bq.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            question_text = None
+
+    # Build previews for non-question files
+    for f, b in loaded:
+        if question_text and (f in [c[1] for c in candidates[:1]]):
+            continue
+        name = f.filename or "file"
+        ext = Path(name).suffix.lower()
+        kind = "unknown"
+        table_name = None
+        sample_text = None
+        sample_records = None
+        shape = None
+        columns = None
+
+        if ext in TABULAR_EXTS:
+            k, recs, shp, cols = _read_tabular_to_df(name, b, f.content_type)
+            if k == "tabular":
+                kind = "tabular"
+                table_name = _sanitize_name(name)
+                sample_records = recs
+                shape = shp
+                columns = cols
+        elif ext in HTML_EXTS:
+            try:
+                txt = b.decode("utf-8", errors="ignore")
+                sample_text = txt[:500]
+                kind = "html"
+            except Exception:
+                kind = "unknown"
+        elif ext in IMAGE_EXTS:
+            kind = "image"
+        elif _is_probably_text(b):
+            kind = "text"
+            sample_text = b.decode("utf-8", errors="ignore")[:500]
+        else:
+            kind = "unknown"
+
+        previews.append(AttachmentPreview(
+            name=name,
+            table_name=table_name,
+            kind=kind,
+            sample_text=sample_text,
+            sample_records=sample_records,
+            shape=shape,
+            columns=columns
+        ))
+
+    return question_text, previews
+
+def attachments_summary_for_llm(previews: List[AttachmentPreview]) -> str:
+    lines = []
+    for p in previews:
+        if p.kind == "tabular":
+            lines.append(f"- {p.name} -> table '{p.table_name}' (rows≈{p.shape[0] if p.shape else '?'}, cols={len(p.columns) if p.columns else '?'}, columns sample={p.columns[:5] if p.columns else []})")
+        elif p.kind == "html":
+            lines.append(f"- {p.name} (html) sample: {repr((p.sample_text or '')[:120])}")
+        elif p.kind == "text":
+            lines.append(f"- {p.name} (text) sample: {repr((p.sample_text or '')[:120])}")
+        elif p.kind == "image":
+            lines.append(f"- {p.name} (image)")
+        else:
+            lines.append(f"- {p.name} (unknown)")
+    return "\n".join(lines) if lines else "(none)"
+
+def build_attachment_tables(previews: List[AttachmentPreview]) -> Dict[str, Any]:
+    """
+    Build DataFrame tables (as dict: name->DataFrame-like records will be created later).
+    We'll store as pandas DataFrames to merge into pipeline tables.
+    """
+    import pandas as pd
+    tables: Dict[str, Any] = {}
+    for p in previews:
+        if p.kind == "tabular" and p.table_name and p.sample_records is not None:
+            # We'll reconstruct small DataFrame from sample records for spec guidance,
+            # but also keep a larger placeholder to be replaced during execution if needed.
+            try:
+                df = pd.DataFrame(p.sample_records)
+                tables[p.table_name] = df
+            except Exception:
+                continue
+    return tables
+
+# ---- Output format detection -------------------------------------------------
+def detect_requested_format(question_text: str) -> Optional[str]:
+    """
+    Detects 'csv', 'json', 'markdown', 'md', 'text', or returns None if unspecified.
+    Also passes through custom schemas by returning None (so LLM can format from instructions).
+    """
+    ql = (question_text or "").lower()
+    # explicit patterns
+    if re.search(r"\b(output|format|return|give|provide|as)\b.*\bjson\b", ql):
+        return "json"
+    if re.search(r"\b(output|format|return|give|provide|as)\b.*\byaml\b", ql):
+        return "yaml"
+    if re.search(r"\b(output|format|return|give|provide|as)\b.*\bcsv\b", ql):
+        return "csv"
+    if re.search(r"\b(output|format|return|give|provide|as)\b.*\bxlxs\b", ql):
+        return "xlxs"
+    if re.search(r"\b(output|format|return|give|provide|as)\b.*\bpq\b", ql):
+        return "pq"
+    if re.search(r"\b(output|format|return|give|provide|as)\b.*\b(markdown|md)\b", ql):
+        return "markdown"
+    if re.search(r"\b(output|format|return|give|provide|as)\b.*\bplain\s*text\b", ql):
+        return "text"
+    return None
+
+# ---- Optimized executor -----------------------------------------------------
+exec(HELPERS, globals(), globals())
+
+ALLOWED_OPS = {
+    "select_columns","rename","dropna","head","sort_values",
+    "filter_query","groupby_agg","join","add_column","parse_dates"
 }
 
-async def contains_dangerous_imports(code: str) -> Optional[str]:
-    lines = code.splitlines()
-    for i, ln in enumerate(lines, 1):
-        s = ln.strip()
-        if s.startswith("import ") or s.startswith("from "):
-            for bad in DANGEROUS_IMPORTS:
-                if re.search(rf"\b{re.escape(bad)}\b", s):
-                    return f"Line {i}: disallowed import: {s}"
-    return None
+def load_inputs(inputs: List[AnalysisInput], logs: List[str]) -> Dict[str, Any]:
+    tables: Dict[str, Any] = {}
+    
+    # Parallel loading for multiple inputs
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_to_input = {}
+        
+        for inp in inputs:
+            if inp.source == "html" and inp.url:
+                future = executor.submit(fetch_text, inp.url, 8, 1)  # Reduced timeout/retries
+                future_to_input[future] = inp
+            elif inp.source == "csv" and inp.url:
+                future = executor.submit(fetch_text, inp.url, 8, 1)
+                future_to_input[future] = inp
+            elif inp.source == "json" and inp.url:
+                future = executor.submit(fetch_json, inp.url, 8)
+                future_to_input[future] = inp
+            else:
+                # Handle non-URL inputs immediately
+                _load_single_input(inp, tables, logs)
+        
+        # Process completed futures
+        for future in as_completed(future_to_input, timeout=15):  # Global timeout
+            inp = future_to_input[future]
+            try:
+                data = future.result()
+                _process_fetched_data(inp, data, tables, logs)
+            except Exception as e:
+                logs.append(f"[inputs] {inp.name}: fetch error {e}")
+    
+    return tables
 
-_LOCAL_IO_PATTERNS = [
-    r"\bpd\.read_csv\(\s*['\"][^)\s]+['\"]\s*\)",
-    r"\bpd\.read_excel\(\s*['\"][^)\s]+['\"]\s*\)",
-    r"\bpd\.read_json\(\s*['\"][^)\s]+['\"]\s*\)",
-    r"\bpd\.read_parquet\(\s*['\"][^)\s]+['\"]\s*\)",
-    r"\bopen\(\s*['\"][^)\s]+['\"]\s*[,)]",
-    r"\bos\.path\b",
-    r"\bPath\(",
-]
+def _load_single_input(inp: AnalysisInput, tables: Dict[str, Any], logs: List[str]):
+    import pandas as pd
+    
+    if inp.source == "csv" and isinstance(inp.data, str):
+        from io import StringIO
+        tables[inp.name] = pd.read_csv(StringIO(inp.data))
+        logs.append(f"[inputs] {inp.name}: inline csv shape={tables[inp.name].shape}")
+    elif inp.source == "json" and inp.data:
+        tables[inp.name] = pd.json_normalize(inp.data)
+        logs.append(f"[inputs] {inp.name}: inline json shape={tables[inp.name].shape}")
+    elif inp.source == "inline":
+        tables[inp.name] = pd.DataFrame(inp.data or [])
+        logs.append(f"[inputs] {inp.name}: inline records shape={tables[inp.name].shape}")
 
-async def contains_local_file_io(code: str) -> Optional[str]:
-    for i, ln in enumerate(code.splitlines(), 1):
-        s = ln.strip()
-        for pat in _LOCAL_IO_PATTERNS:
-            if re.search(pat, s):
-                return f"Line {i}: local file I/O is not allowed: {s}"
-    return None
+def _process_fetched_data(inp: AnalysisInput, data: Any, tables: Dict[str, Any], logs: List[str]):
+    import pandas as pd
+    
+    if inp.source == "html":
+        dfs = read_table_html(data)
+        if dfs:
+            idx = min(inp.table_index or 0, len(dfs) - 1)
+            tables[inp.name] = dfs[idx].head(1000)  # Limit rows for speed
+            logs.append(f"[inputs] {inp.name}: html table shape={tables[inp.name].shape}")
+    elif inp.source == "csv":
+        from io import StringIO
+        df = pd.read_csv(StringIO(data))
+        tables[inp.name] = df.head(1000)  # Limit rows for speed
+        logs.append(f"[inputs] {inp.name}: csv shape={tables[inp.name].shape}")
+    elif inp.source == "json":
+        df = pd.json_normalize(data)
+        tables[inp.name] = df.head(1000)  # Limit rows for speed
+        logs.append(f"[inputs] {inp.name}: json shape={tables[inp.name].shape}")
 
-# ---- Requirement-aware validator --------------------------------------------
-_REQ_JSON_KEYS = re.compile(r"Return a JSON object with keys?:\s*(.+)", re.IGNORECASE | re.DOTALL)
-_REQ_JSON_ARRAY = re.compile(r"\brespond with a JSON array\b|\breturn a JSON array\b", re.IGNORECASE)
-_REQ_CSV       = re.compile(r"\breturn .*CSV\b|\bCSV with columns\b", re.IGNORECASE)
-_REQ_HTML      = re.compile(r"\bHTML table\b", re.IGNORECASE)
-_REQ_IMAGES    = re.compile(r"\b(base-?64|data uri|data:image/png)\b", re.IGNORECASE)
+def apply_transform(df_map: Dict[str, Any], t: Transform, logs: List[str]) -> None:
+    if t.op not in ALLOWED_OPS:
+        logs.append(f"[transform] unsupported op {t.op}")
+        return
+    if t.target not in df_map:
+        logs.append(f"[transform] missing target {t.target}")
+        return
+    
+    import pandas as pd
+    df = df_map[t.target]
+    
+    try:
+        if t.op == "select_columns":
+            cols = t.args.get("columns", [])
+            df_map[t.target] = df[cols]
+        elif t.op == "rename":
+            mapping = t.args.get("map", {})
+            df_map[t.target] = df.rename(columns=mapping)
+        elif t.op == "dropna":
+            subset = t.args.get("subset", None)
+            df_map[t.target] = df.dropna(subset=subset)
+        elif t.op == "head":
+            n = min(int(t.args.get("n", 10)), 100)  # Cap at 100 for speed
+            df_map[t.target] = df.head(n)
+        elif t.op == "sort_values":
+            by = t.args.get("by")
+            asc = bool(t.args.get("ascending", True))
+            df_map[t.target] = df.sort_values(by=by, ascending=asc)
+        elif t.op == "filter_query":
+            q = t.args.get("query", "")
+            df_map[t.target] = df.query(q)
+        elif t.op == "groupby_agg":
+            by = t.args.get("by", [])
+            aggs = t.args.get("aggs", {})
+            df_map[t.target] = df.groupby(by, dropna=False).agg(aggs).reset_index()
+        elif t.op == "join":
+            right = t.args.get("right")
+            how = t.args.get("how", "left")
+            on = t.args.get("on")
+            if right not in df_map:
+                logs.append(f"[transform] join: right table {right} missing")
+            else:
+                df_map[t.target] = df.merge(df_map[right], how=how, on=on)
+        elif t.op == "add_column":
+            name = t.args.get("name")
+            expr = t.args.get("expr")
+            if name and expr:
+                df_map[t.target][name] = pd.eval(expr, engine="python", parser="pandas", target=df_map[t.target])
+        elif t.op == "parse_dates":
+            cols = t.args.get("columns", [])
+            for c in cols:
+                df_map[t.target][c] = pd.to_datetime(df_map[t.target][c], errors="coerce")
+        logs.append(f"[transform] {t.op} on {t.target}: shape={df_map[t.target].shape}")
+    except Exception as e:
+        logs.append(f"[transform] {t.op} error: {e}")
 
-def _parse_required_keys(q: str) -> List[str]:
-    m = _REQ_JSON_KEYS.search(q)
-    if not m:
+def render_charts(df_map: Dict[str, Any], charts: List[ChartSpec], logs: List[str]) -> List[str]:
+    if not charts:  # Skip if no charts requested
         return []
-    block = m.group(1)
-    keys = re.findall(r"`([^`]+)`|([A-Za-z0-9_]+)", block)
-    out = []
-    for a,b in keys:
-        k = (a or b).strip()
-        if k:
-            out.append(k)
-    return list(dict.fromkeys(out))
+    
+    images: List[str] = []
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend for speed
+    import matplotlib.pyplot as plt
+    
+    for ch in charts[:3]:  # Limit to 3 charts max for speed
+        if ch.table not in df_map:
+            logs.append(f"[chart] missing table {ch.table}")
+            continue
+        df = df_map[ch.table].head(200)  # Limit data points for speed
+        try:
+            fig, ax = plt.subplots(figsize=(6, 4))  # Smaller figures
+            
+            if ch.kind == "line":
+                if isinstance(ch.y, list):
+                    for col in ch.y[:3]:  # Max 3 series
+                        ax.plot(df[ch.x], df[col], label=col)
+                    ax.legend()
+                else:
+                    ax.plot(df[ch.x], df[ch.y])
+            elif ch.kind == "bar":
+                ycol = ch.y if isinstance(ch.y, str) else (ch.y[0] if ch.y else None)
+                ax.bar(df[ch.x], df[ycol])
+            elif ch.kind == "scatter":
+                ycol = ch.y if isinstance(ch.y, str) else (ch.y[0] if ch.y else None)
+                ax.scatter(df[ch.x], df[ycol], alpha=0.6, s=20)  # Smaller markers
+            elif ch.kind == "hist":
+                ycol = ch.y if isinstance(ch.y, str) else (ch.y[0] if ch.y else None)
+                bins = min(ch.bins or 20, 20)  # Limit bins
+                ax.hist(df[ycol], bins=bins)
+            
+            if ch.title: 
+                ax.set_title(ch.title)
+            
+            images.append(fig_to_data_uri(fig))
+            logs.append(f"[chart] {ch.kind} on {ch.table}")
+        except Exception as e:
+            logs.append(f"[chart] error: {e}")
+    
+    return images
 
-def _expects_json_object(q: str) -> bool: return bool(_REQ_JSON_KEYS.search(q))
-def _expects_json_array(q: str)  -> bool: return bool(_REQ_JSON_ARRAY.search(q))
-def _expects_csv(q: str)         -> bool: return bool(_REQ_CSV.search(q))
-def _expects_html(q: str)        -> bool: return bool(_REQ_HTML.search(q))
-def _mentions_images(q: str)     -> bool: return bool(_REQ_IMAGES.search(q))
+def summarize(answer: AnswerSpec, df_map: Dict[str, Any], logs: List[str]) -> Any:
+    if answer.type == "none":
+        return None
+    
+    import pandas as pd
+    
+    if answer.type == "basic_stats":
+        tname = answer.table or next(iter(df_map.keys()), None)
+        if not tname or tname not in df_map:
+            return {"note": "no table available for stats"}
+        df = df_map[tname]
+        cols = (answer.columns or [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])])[:5]  # Limit cols
+        out = {}
+        for c in cols:
+            try:
+                s = df[c].dropna()
+                out[c] = {
+                    "count": int(s.count()),
+                    "mean": float(s.mean()) if len(s) else None,
+                    "min": float(s.min()) if len(s) else None,
+                    "max": float(s.max()) if len(s) else None,
+                }
+            except Exception:
+                out[c] = {"error": "stat failed"}
+        logs.append(f"[answer] basic_stats on {tname}")
+        return out
+    
+    if answer.type == "text_summary":
+        tname = answer.table or next(iter(df_map.keys()), None)
+        if not tname or tname not in df_map:
+            return "No data available."
+        df = df_map[tname]
+        return f"Rows: {len(df)}, Columns: {len(df.columns)}. Sample cols: {list(df.columns)[:3]}"
+    
+    return None
 
-async def validate_final_result(stdout_text: str) -> Dict[str, Any]:
-    data = await coerce_json(stdout_text)
+def validate_final_result(data: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("Output is not a JSON object.")
     missing = REQUIRED_FINAL_KEYS - set(data.keys())
     if missing:
         raise ValueError(f"Output missing required keys: {sorted(missing)}")
-    if not isinstance(data["tables"], dict):
-        raise ValueError("final_result.tables must be a dict of name -> list[dict].")
-    if not isinstance(data["images"], list):
-        raise ValueError("final_result.images must be a list.")
-    if not isinstance(data["logs"], list):
-        raise ValueError("final_result.logs must be a list.")
     return data
 
-async def validate_against_question(question: str, final_result: Dict[str, Any]) -> Optional[str]:
-    ans = final_result.get("answer", None)
-    if ans is None:
-        return "final_result.answer is missing."
+def make_formatter_prompt(question: str, final_result: Dict[str, Any], requested_format: Optional[str]) -> str:
+    # Simplified prompt for faster processing, includes requested format
+    return f"REQUESTED OUTPUT FORMAT: {requested_format}\nQuestion: {question}\nData: {json.dumps(final_result, default=str)[:2000]}"
 
-    if _expects_json_array(question):
-        if not isinstance(ans, list):
-            return "Expected a JSON array in final_result.answer."
-    elif _expects_json_object(question):
-        if not isinstance(ans, dict):
-            return "Expected a JSON object in final_result.answer."
-        req_keys = _parse_required_keys(question)
-        if req_keys:
-            missing = [k for k in req_keys if k not in ans]
-            if missing:
-                return f"Missing required JSON keys in final_result.answer: {missing}"
-        if _mentions_images(question):
-            # enforce 100kB cap for any data URI inside answer
-            for k,v in ans.items():
-                if isinstance(v, str) and v.startswith("data:image/png;base64,"):
-                    try:
-                        b = base64.b64decode(v.split(",",1)[1], validate=False)
-                        if len(b) >= 100_000:
-                            return f"Image in key '{k}' exceeds 100kB ({len(b)} bytes). Reduce figure size/dpi."
-                    except Exception:
-                        return f"Image in key '{k}' is not valid base64 data URI."
-    elif _expects_csv(question):
-        if not isinstance(ans, str) or "," not in ans:
-            return "Expected CSV text in final_result.answer."
-    elif _expects_html(question):
-        low = (ans if isinstance(ans, str) else "").lower()
-        if "<table" not in low or "</table>" not in low:
-            return "Expected an HTML table in final_result.answer."
-    # Otherwise free-form format is acceptable
-    return None
-
-async def make_coder_prompt(plan: Plan) -> str:
-    schema_hint = """Internal final_result schema:
-{
-  "answer": <any JSON-serializable>,
-  "tables": { "<name>": [ {<record>}, ... ] },
-  "images": [ "data:image/png;base64,...", ... ],
-  "logs": [ "string", ... ]
-}
-"""
-    return (
-        f"Original question:\n{plan.question}\n\n"
-        f"Plan JSON:\n{plan.json(indent=2)}\n\n"
-        f"{schema_hint}\n"
-        "Write the analysis code now."
+# ---- FRESH fallback spec generator ------------------------------------------
+def make_fresh_spec_from_attachments(question: str, previews: List[AttachmentPreview]) -> AnalysisSpec:
+    """
+    Minimal, robust spec: pick first tabular attachment if present.
+    """
+    # Choose table
+    table_name = None
+    for p in previews:
+        if p.kind == "tabular" and p.table_name:
+            table_name = p.table_name
+            break
+    if table_name is None:
+        # No tabular data; return empty minimal spec
+        return AnalysisSpec(
+            inputs=[AnalysisInput(name="dummy", source="inline", data=[])],
+            transforms=[],
+            charts=[],
+            answer=AnswerSpec(type="text_summary", table="dummy"),
+            result_table="dummy"
+        )
+    # Build simple spec
+    return AnalysisSpec(
+        inputs=[AnalysisInput(name=table_name, source="inline", data=[])],  # data will be ignored; tables will be injected
+        transforms=[Transform(target=table_name, op="head", args={"n": 50})],
+        charts=[],
+        answer=AnswerSpec(type="basic_stats", table=table_name),
+        result_table=table_name
     )
 
-async def make_debugger_prompt(plan: Plan, prev_code: str, stdout_text: str, stderr_text: str) -> str:
-    s_out = stdout_text[-2000:]
-    s_err = stderr_text[-2000:]
-    s_code = prev_code[-4000:]
-    return (
-        "PLAN (JSON):\n"
-        + plan.json(indent=2)
-        + "\n\nPREVIOUS CODE:\n"
-        + s_code
-        + "\n\nSTDOUT (tail):\n"
-        + s_out
-        + "\n\nSTDERR (tail):\n"
-        + s_err
-        + "\n\nPlease return corrected Python code only."
-    )
+# ---- Optimized pipeline execution -------------------------------------------
+def run_analysis_spec(spec: AnalysisSpec, attachment_tables: Dict[str, Any]) -> Dict[str, Any]:
+    logs: List[str] = []
+    
+    # Load inputs (with parallel fetching)
+    tables = load_inputs(spec.inputs, logs)
 
-async def build_executable_source(generated_code: str, attachments: List[Dict[str, Any]]) -> str:
-    attachments_py_json = json.dumps(attachments, separators=(",", ":"))
-    prelude = f"""
-ATTACHMENTS = {attachments_py_json}
-
-import base64, io, json, pandas as pd, numpy as np
-
-try:
-    import pyarrow  # noqa: F401
-    _HAS_ARROW = True
-except Exception:
-    _HAS_ARROW = False
-
-try:
-    from PIL import Image
-    _HAS_PIL = True
-except Exception:
-    _HAS_PIL = False
-
-def _get_bytes(name):
-    for a in ATTACHMENTS:
-        if a["filename"] == name:
-            return base64.b64decode(a["data_b64"])
-    raise FileNotFoundError(name)
-
-def list_attachments():
-    return [{{"filename": a["filename"], "content_type": a["content_type"], "size": a["size"]}} for a in ATTACHMENTS]
-
-def read_text_attachment(name, encoding="utf-8"):
-    return _get_bytes(name).decode(encoding, errors="replace")
-
-def read_json_attachment(name):
-    return json.loads(read_text_attachment(name))
-
-def read_csv_attachment(name, **kwargs):
-    return pd.read_csv(io.BytesIO(_get_bytes(name)), **kwargs)
-
-def read_excel_attachment(name, **kwargs):
-    return pd.read_excel(io.BytesIO(_get_bytes(name)), **kwargs)
-
-def read_parquet_attachment(name, **kwargs):
-    if not _HAS_ARROW:
-        raise RuntimeError("Parquet requires pyarrow or fastparquet.")
-    return pd.read_parquet(io.BytesIO(_get_bytes(name)), **kwargs)
-
-def read_image_attachment(name):
-    b = _get_bytes(name)
-    if _HAS_PIL:
-        return Image.open(io.BytesIO(b))
-    import matplotlib.image as mpimg
-    return mpimg.imread(io.BytesIO(b))
-
-def load_dataframe_auto(name):
-    low = name.lower()
-    if low.endswith(".csv"):
-        return read_csv_attachment(name)
-    if low.endswith(".json"):
-        js = read_json_attachment(name)
-        if isinstance(js, list):
-            return pd.DataFrame(js)
-        if isinstance(js, dict):
-            return pd.json_normalize(js, sep="_")
-        raise ValueError("JSON not table-like")
-    if low.endswith(".xlsx") or low.endswith(".xls"):
-        return read_excel_attachment(name)
-    if low.endswith(".parquet") or low.endswith(".pq"):
-        return read_parquet_attachment(name)
-    # try generic CSV then JSON
-    try:
-        return read_csv_attachment(name)
-    except Exception:
+    # Merge in attachment tables (always available by table_name)
+    for k, v in attachment_tables.items():
+        if k not in tables:
+            tables[k] = v
+            logs.append(f"[inputs] attachment injected: {k} shape={getattr(v,'shape',None)}")
+    
+    # Apply transforms sequentially (but limited)
+    for t in spec.transforms[:10]:  # Limit transforms for speed
+        apply_transform(tables, t, logs)
+    
+    # Build images (limited)
+    images = render_charts(tables, spec.charts, logs)
+    
+    # Choose result table
+    res_name = spec.result_table
+    if res_name not in tables and tables:
+        res_name = next(iter(tables.keys()))
+    
+    # Prepare tables output (smaller previews)
+    tables_out: Dict[str, List[Dict[str, Any]]] = {}
+    for name, df in tables.items():
         try:
-            js = read_json_attachment(name)
-            return pd.json_normalize(js, sep="_") if isinstance(js, dict) else pd.DataFrame(js)
+            preview = df.head(50)  # Much smaller preview
+            tables_out[name] = df_to_records(preview)
         except Exception:
-            raise ValueError(f"Unsupported tabular file: {{name}}")
-
-def is_image_name(name):
-    return name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"))
-"""
-    return HELPERS + "\n" + prelude + "\n" + generated_code + "\n"
-
-async def make_formatter_prompt(question: str, final_result: Dict[str, Any]) -> str:
-    payload = {
-        "question": question,
-        "final_result": final_result,
+            tables_out[name] = []
+    
+    # Generate answer
+    ans = summarize(spec.answer, tables, logs)
+    
+    final_result = {
+        "answer": ans,
+        "tables": {res_name: tables_out.get(res_name, [])},
+        "images": images,
+        "logs": logs,
     }
-    return json.dumps(payload, indent=2)
+    
+    return final_result
 
-# ---- API --------------------------------------------------------------------
+# ---- Parallel API execution with 2 debug tries + fresh fallback -------------
+async def analyze_question_async(question: str, previews: List[AttachmentPreview], requested_format: Optional[str], debug: int = 0):
+    if not LLM_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY/LLM_API_KEY is not set.")
+
+    attachments_summary = attachments_summary_for_llm(previews)
+    attachment_tables = build_attachment_tables(previews)
+
+    last_err: Optional[str] = None
+
+    # Attempt 1: normal
+    for attempt in range(1, 4):  # 1=normal, 2=debug try 1, 3=debug try 2
+        debug_hint = None if attempt == 1 else f"Previous error: {last_err}. Prefer using the provided attachments via inline inputs. Avoid network fetches."
+        try:
+            # Step 1: Plan (fast)
+            plan = plan_question(question if attempt == 1 else f"{question}\n\n(You have attachments. See list below.)\n{attachments_summary}")
+            # Step 2: Generate spec (single attempt)
+            spec = generate_analysis_spec(plan, attachments_summary, debug_hint=debug_hint)
+            # Step 3: Execute spec
+            final_structured = run_analysis_spec(spec, attachment_tables)
+            final_structured = validate_final_result(final_structured)
+            # Step 4: Format output (with requested format)
+            fmt_prompt = make_formatter_prompt(question, final_structured, requested_format)
+            formatted = llm_call_raw(OUTPUT_FORMATTER_SYSTEM, fmt_prompt, FORMATTER_MODEL, temperature=0, max_tokens=500)
+            if debug == 1:
+                return JSONResponse({
+                    "ok": True,
+                    "formatted_output": formatted,
+                    "internal_final_result": final_structured,
+                    "debug": {
+                        "plan": plan.model_dump(),
+                        "analysis_spec": spec.model_dump(),
+                        "attempt": attempt,
+                        "performance_mode": "speed_optimized",
+                        "attachments": [p.model_dump() for p in previews]
+                    }
+                })
+            return Response(formatted, media_type="text/plain")
+        except Exception as e:
+            last_err = str(e)
+
+    # Fresh fallback (programmatic minimal spec)
+    try:
+        spec = make_fresh_spec_from_attachments(question, previews)
+        final_structured = run_analysis_spec(spec, attachment_tables)
+        final_structured = validate_final_result(final_structured)
+        fmt_prompt = make_formatter_prompt(question, final_structured, requested_format)
+        formatted = llm_call_raw(OUTPUT_FORMATTER_SYSTEM, fmt_prompt, FORMATTER_MODEL, temperature=0, max_tokens=500)
+        if debug == 1:
+            return JSONResponse({
+                "ok": True,
+                "formatted_output": formatted,
+                "internal_final_result": final_structured,
+                "debug": {
+                    "plan": "(fresh-fallback)",
+                    "analysis_spec": spec.model_dump(),
+                    "attempt": "fresh_fallback",
+                    "previous_error": last_err,
+                    "attachments": [p.model_dump() for p in previews]
+                }
+            })
+        return Response(formatted, media_type="text/plain")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"All attempts failed. Last error: {last_err} | Fresh fallback error: {e}")
+
+from fastapi import FastAPI, Request, UploadFile, HTTPException
+
 @app.post("/api/")
 async def analyze_question(
     request: Request,
     debug: int = Query(0, description="Set to 1 to include debug payloads (JSON)."),
 ):
-    if not LLM_API_KEY:
-        raise HTTPException(status_code=500, detail="LLM_API_KEY/OPENAI_API_KEY is not set.")
-
+    
     try:
         form = await request.form()
     except Exception as e:
@@ -497,252 +937,45 @@ async def analyze_question(
                 },
             )
         raise HTTPException(status_code=400, detail="No files uploaded")
+        
+    question_text, previews = build_attachment_previews(files)
+    if not question_text:
+        raise HTTPException(status_code=400, detail="Could not detect a question file.")
 
-    async def read_bytes(f: UploadFile) -> bytes:
-        return await f.read()
-
-    async def is_text_like(upload: UploadFile, data: bytes) -> bool:
-        ct = (getattr(upload, "content_type", "") or "").lower()
-        if ct.startswith("text/") or ct in {"application/json", "application/xml"}:
-            return True
-        try:
-            data.decode("utf-8")
-            return True
-        except UnicodeDecodeError:
-            return False
-
-    file_blobs: List[Dict[str, Any]] = []
-    first_text_payload: Optional[str] = None
-    first_text_filename: Optional[str] = None
-
-    for f in files:
-        blob = await read_bytes(f)
-
-        file_blobs.append({
-            "filename": f.filename,
-            "content_type": (getattr(f, "content_type", "") or "application/octet-stream"),
-            "data_b64": base64.b64encode(blob).decode("ascii"),
-            "size": len(blob),
-        })
-
-        if first_text_payload is None and await is_text_like(f, blob):
-            try:
-                first_text_payload = blob.decode("utf-8").strip()
-                first_text_filename = f.filename
-            except UnicodeDecodeError:
-                pass
-
-    if not first_text_payload:
-        if debug == 1:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "ok": False,
-                    "error": "No text-like file found for the question",
-                    "observed_files": [
-                        {"filename": a["filename"], "content_type": a["content_type"], "size": a["size"]}
-                        for a in file_blobs
-                    ],
-                    "observed_form_keys": seen_keys,
-                    "hint": "Upload at least one UTF-8 text file (e.g., .txt, .md, .json) containing the question/instructions.",
-                },
-            )
-        raise HTTPException(
-            status_code=400,
-            detail="No text-like file found for the question. Upload at least one UTF-8 text file (e.g., .txt, .md, JSON).",
-        )
-
-    question = first_text_payload
-
-    # === 1) Plan ===
-    try:
-        plan = await plan_question(question)
-    except ValidationError as ve:
-        raise HTTPException(status_code=500, detail=f"Planner JSON invalid: {ve}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Planner failed: {e}")
-
-    # === 2) Generate code ===
-    coder_prompt = await make_coder_prompt(plan)
-    raw_code = await llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, temperature=0.1, attachments=file_blobs)
-    generated_code = await extract_code(raw_code)
-
-    bad = await contains_dangerous_imports(generated_code) or await contains_local_file_io(generated_code)
-    if bad:
-        dbg_prompt = await make_debugger_prompt(plan, generated_code, "", bad)
-        raw_fixed = await llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
-        generated_code = await extract_code(raw_fixed)
-
-    # === 3) Execute with retries + debugger (with async LLM calls) ===
-    MAX_RETRIES = 4
-    debug_attempts = 0
-    last_stdout = ""
-    last_stderr = ""
-    last_code = generated_code
-    final_structured: Optional[Dict[str, Any]] = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        to_run = await build_executable_source(last_code, file_blobs)
-        stdout, stderr, returncode = await run_python_code(to_run)
-        last_stdout, last_stderr = stdout, stderr
-
-        if returncode == 0:
-            try:
-                final_structured = await validate_final_result(stdout.strip())
-                # Requirement-aware validation (ensures base64 keys, CSV/HTML/JSON shapes, image size caps, etc.)
-                req_err = await validate_against_question(question, final_structured)
-                if req_err:
-                    raise ValueError(f"RequirementError: {req_err}")
-                break
-            except Exception as ve:
-                if debug_attempts < 2:
-                    dbg_prompt = await make_debugger_prompt(plan, last_code, stdout, f"ValidationError: {ve}")
-                    raw_fixed = await llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
-                    last_code = await extract_code(raw_fixed)
-                    # re-lint new code
-                    bad2 = await contains_dangerous_imports(last_code) or await contains_local_file_io(last_code)
-                    if bad2:
-                        # force another debugger pass immediately to remove local I/O / dangerous imports
-                        dbg_prompt2 = await make_debugger_prompt(plan, last_code, "", bad2)
-                        raw_fixed2 = await llm_call(DEBUGGER_SYSTEM, dbg_prompt2, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
-                        last_code = await extract_code(raw_fixed2)
-                    debug_attempts += 1
-                    continue
-                else:
-                    fresh_raw = await llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, temperature=0.1, attachments=file_blobs)
-                    fresh_code = await extract_code(fresh_raw)
-                    bad2 = await contains_dangerous_imports(fresh_code) or await contains_local_file_io(fresh_code)
-                    if bad2:
-                        fix_prompt = await make_debugger_prompt(plan, fresh_code, "", bad2)
-                        fixed_fresh = await llm_call(DEBUGGER_SYSTEM, fix_prompt, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
-                        fresh_code = await extract_code(fixed_fresh)
-                    last_code = fresh_code
-                    continue
-        else:
-            if debug_attempts < 2:
-                dbg_prompt = await make_debugger_prompt(plan, last_code, stdout, stderr)
-                raw_fixed = await llm_call(DEBUGGER_SYSTEM, dbg_prompt, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
-                last_code = await extract_code(raw_fixed)
-                bad2 = await contains_dangerous_imports(last_code) or await contains_local_file_io(last_code)
-                if bad2:
-                    dbg_prompt2 = await make_debugger_prompt(plan, last_code, "", bad2)
-                    raw_fixed2 = await llm_call(DEBUGGER_SYSTEM, dbg_prompt2, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
-                    last_code = await extract_code(raw_fixed2)
-                debug_attempts += 1
-                continue
-            else:
-                fresh_raw = await llm_call(CODER_SYSTEM, coder_prompt, CODER_MODEL, temperature=0.1, attachments=file_blobs)
-                fresh_code = await extract_code(fresh_raw)
-                bad2 = await contains_dangerous_imports(fresh_code) or await contains_local_file_io(fresh_code)
-                if bad2:
-                    fix_prompt = await make_debugger_prompt(plan, fresh_code, "", bad2)
-                    fixed_fresh = await llm_call(DEBUGGER_SYSTEM, fix_prompt, DEBUGGER_MODEL, temperature=0.1, attachments=file_blobs)
-                    fresh_code = await extract_code(fixed_fresh)
-                last_code = fresh_code
-                continue
-
-    if final_structured is None:
-        if debug == 1:
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "ok": False,
-                    "error": "Execution failed after retries.",
-                    "stderr_tail": last_stderr[-1000:],
-                    "stdout_tail": last_stdout[-1000:],
-                    "plan": plan.model_dump(),
-                    "generated_code": last_code,
-                    "question_file": first_text_filename,
-                    "attachments": [
-                        {"filename": a["filename"], "content_type": a["content_type"], "size": a["size"]}
-                        for a in file_blobs
-                    ],
-                },
-            )
-        return Response(
-            "Execution failed after retries.\n"
-            f"STDERR (tail):\n{last_stderr[-1000:]}\n\nSTDOUT (tail):\n{last_stdout[-1000:]}\n",
-            media_type="text/plain",
-            status_code=500,
-        )
-
-    # === 4) Format ===
-    fmt_prompt = await make_formatter_prompt(question, final_structured)
-    formatted = await llm_call(OUTPUT_FORMATTER_SYSTEM, fmt_prompt, FORMATTER_MODEL, temperature=0.2, attachments=file_blobs)
-
-    if debug == 1:
-        return JSONResponse(
-            {
-                "ok": True,
-                "formatted_output": formatted,
-                "internal_final_result": final_structured,
-                "debug": {
-                    "plan": plan.model_dump(),
-                    "generated_code": last_code,
-                    "stdout_tail": last_stdout[-2000:],
-                    "stderr_tail": last_stderr[-2000:],
-                    "question_file": first_text_filename,
-                    "observed_form_keys": seen_keys,
-                    "attachments": [
-                        {"filename": a["filename"], "content_type": a["content_type"], "size": a["size"]}
-                        for a in file_blobs
-                    ],
-                    "models": {
-                        "planner": PLANNER_MODEL,
-                        "coder": CODER_MODEL,
-                        "debugger": DEBUGGER_MODEL,
-                        "formatter": FORMATTER_MODEL,
-                        "base_url": LLM_BASE_URL,
-                    },
-                },
-            }
-        )
-
-    return Response(formatted, media_type="text/plain")
-
-# ---- Executor (sandbox) -----------------------------------------------------
-async def run_python_code(code: str, timeout: int = 120) -> Tuple[str, str, int]:
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write(code)
-            temp_file = f.name
-
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, temp_file,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            return stdout.decode(), stderr.decode(), proc.returncode
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return "", "Process timed out", -1
-        finally:
-            try:
-                os.unlink(temp_file)
-            except Exception:
-                pass
-    except Exception as e:
-        return "", f"Execution error: {str(e)}", -1
-
-# ---- Health / Root ----------------------------------------------------------
+    requested_format = detect_requested_format(question_text)
+    return await analyze_question_async(question_text, previews, requested_format, debug)
+  
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "version": "4.2.0-speed-optimized"}
 
 @app.get("/")
 async def root():
     return {
-        "message": "Universal Data Analyst API v4 (robust, format-aware, attachment-first, web-helper only)",
-        "usage": "curl -s -X POST 'http://localhost:8000/api/?debug=1' -F 'questions.txt=@question.txt' -F 'other_files...'",
+        "message": "Universal Data Analyst API v4.2 (Speed Optimized)",
+        "usage": [
+            "curl -s -X POST 'http://localhost:8000/api/?debug=1' -F 'questions.txt=@question.txt' -F 'data.csv=@data.csv'",
+            "curl -s -X POST 'http://localhost:8000/api/' -F 'prompt.md=@prompt.md' -F 'dataset.parquet=@dataset.parquet'"
+        ],
+        "optimizations": [
+            "Reduced network timeouts (8s vs 20s)",
+            "Parallel input fetching",
+            "Single-shot spec generation (no best-of-N)",
+            "Limited data processing (1000 rows max per input)",
+            "Optimized chart rendering (lower DPI, smaller figures)",
+            "Truncated LLM responses (max_tokens limits)",
+            "Async processing pipeline",
+            "Arbitrary multipart field names (auto-detect question vs attachments)",
+            "Requested output format inferred from question",
+            "Two debug retries + fresh fallback"
+        ],
         "notes": [
-            "The planner extracts format requirements (JSON/CSV/HTML/images) directly from the question.",
-            "The coder uses only attachment/web helper functions; local file paths are lint-blocked.",
-            "A requirement-aware validator forces exact outward format (keys, arrays, CSV/HTML) and image size caps.",
-            "The formatter passes through exact requested formats instead of inventing fields.",
-            "Temperatures tuned low for consistency on gpt-4o-mini."
-        ]
+            "Tabular attachments (csv/tsv/json/ndjson/parquet/feather/xlsx) are auto-exposed as tables by sanitized filename.",
+            "Images and unknown binaries are accepted as context but not parsed into tables."
+        ],
+        "target_performance": "< 3 minutes"
     }
 
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
