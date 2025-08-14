@@ -1,3 +1,49 @@
+Hugging Face's logo
+Hugging Face
+Models
+Datasets
+Spaces
+Community
+Docs
+Enterprise
+Pricing
+
+
+
+Spaces:
+
+KarvySingh
+/
+DataAnalyst
+
+
+like
+0
+
+Logs
+App
+Files
+Community
+Settings
+DataAnalyst
+/
+app.py
+
+KarvySingh's picture
+KarvySingh
+Update app.py
+d0e99a4
+verified
+less than a minute ago
+raw
+
+Copy download link
+history
+blame
+edit
+delete
+
+45.2 kB
 import os
 import re
 import json
@@ -8,6 +54,11 @@ import io
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+import magic, io, csv, json, pandas as pd, numpy as np
+from charset_normalizer import from_bytes
+import pdfplumber, xmltodict
+from PIL import Image
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -34,7 +85,6 @@ app = FastAPI(title="Universal Data Analyst (speed-optimized)", version="4.2.0")
 # ---- Prompts ----------------------------------------------------------------
 # Simplified planner for faster processing
 PLANNER_SYSTEM = """You are a planning engine. Output STRICT JSON that validates this schema:
-
 {
   "type": "object",
   "properties": {
@@ -46,12 +96,10 @@ PLANNER_SYSTEM = """You are a planning engine. Output STRICT JSON that validates
   "required": ["question", "parameters", "steps", "final_variables"],
   "additionalProperties": false
 }
-
 Keep steps minimal (max 3). Return JSON only. No commentary."""
 
 # Streamlined coder prompt for faster generation
 CODER_SYSTEM = """You write ONLY STRICT JSON analysis specs. Be concise and efficient.
-
 Schema (must validate exactly):
 {
   "type": "object",
@@ -118,13 +166,11 @@ Schema (must validate exactly):
   "required": ["inputs","transforms","charts","answer","result_table"],
   "additionalProperties": false
 }
-
 Minimize transforms. Prefer simple operations. Return JSON only."""
 
 # Simplified formatter for speed — respects requested output format
 OUTPUT_FORMATTER_SYSTEM = """
 Your task is to produce the final result in the exact format requested by the user.
-
 Rules:
 - Read the user request carefully and identify any explicit or implicit output format or schema, no matter what it is called or how it is described.
 - Follow that format or schema exactly, including structure, syntax, spacing, and punctuation.
@@ -142,7 +188,6 @@ import requests, pandas as pd
 from bs4 import BeautifulSoup
 import numpy as np
 import matplotlib.pyplot as plt
-
 def fetch_text(url, timeout=8, retries=1):
     last = None
     headers = {"User-Agent": "Mozilla/5.0 (compatible; UDA/4.0)"}
@@ -156,13 +201,11 @@ def fetch_text(url, timeout=8, retries=1):
             if _ < retries:
                 time.sleep(0.5)  # Reduced sleep
     raise last
-
 def fetch_json(url, timeout=8):
     headers = {"User-Agent": "Mozilla/5.0 (compatible; UDA/4.0)"}
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.json()
-
 def read_table_html(html):
     try:
         dfs = pd.read_html(html)
@@ -179,10 +222,8 @@ def read_table_html(html):
             except Exception:
                 pass
         return out
-
 def df_to_records(df):
     return df.replace({pd.NA: None, np.nan: None}).to_dict(orient="records")
-
 def fig_to_data_uri(fig):
     import io, base64
     buf = io.BytesIO()
@@ -367,63 +408,172 @@ class AttachmentPreview(BaseModel):
     shape: Optional[Tuple[int, int]] = None
     columns: Optional[List[str]] = None
 
-def _read_tabular_to_df(name: str, data: bytes, content_type: Optional[str]) -> Tuple[str, Optional[List[Dict[str, Any]]], Optional[Tuple[int,int]], Optional[List[str]]]:
-    import pandas as pd
-    ext = Path(name).suffix.lower()
-    buf = io.BytesIO(data)
-    df = None
-    if ext in {".csv", ".tsv"}:
-        sep = "\t" if ext == ".tsv" else ","
-        df = pd.read_csv(buf, sep=sep)
-    elif ext in {".json", ".ndjson"}:
-        try:
-            text = data.decode("utf-8")
-            # try ndjson first
-            if "\n" in text and text.strip().startswith("{") and text.strip().endswith("}"):
-                df = pd.read_json(io.StringIO(text), lines=True)
-            else:
-                j = json.loads(text)
-                df = pd.json_normalize(j)
-        except Exception:
-            df = pd.read_json(buf, lines=True)
-    elif ext in {".parquet", ".pq", ".feather"}:
-        df = pd.read_parquet(buf)
-    elif ext in {".xlsx", ".xls"}:
-        df = pd.read_excel(buf)
-    else:
-        # last resort: try csv
-        try:
-            df = pd.read_csv(io.BytesIO(data))
-        except Exception:
-            df = None
-    if df is None:
-        return "unknown", None, None, None
-    df = df.head(1000)
-    return "tabular", df_to_records(df.head(50)), df.shape, list(df.columns)[:50]
+# def _read_tabular_to_df(name: str, data: bytes, content_type: Optional[str]) -> Tuple[str, Optional[List[Dict[str, Any]]], Optional[Tuple[int,int]], Optional[List[str]]]:
+#     import pandas as pd
+#     ext = Path(name).suffix.lower()
+#     buf = io.BytesIO(data)
+#     df = None
+#     if ext in {".csv", ".tsv"}:
+#         sep = "\t" if ext == ".tsv" else ","
+#         df = pd.read_csv(buf, sep=sep)
+#     elif ext in {".json", ".ndjson"}:
+#         try:
+#             text = data.decode("utf-8")
+#             # try ndjson first
+#             if "\n" in text and text.strip().startswith("{") and text.strip().endswith("}"):
+#                 df = pd.read_json(io.StringIO(text), lines=True)
+#             else:
+#                 j = json.loads(text)
+#                 df = pd.json_normalize(j)
+#         except Exception:
+#             df = pd.read_json(buf, lines=True)
+#     elif ext in {".parquet", ".pq", ".feather"}:
+#         df = pd.read_parquet(buf)
+#     elif ext in {".xlsx", ".xls"}:
+#         df = pd.read_excel(buf)
+#     else:
+#         # last resort: try csv
+#         try:
+#             df = pd.read_csv(io.BytesIO(data))
+#         except Exception:
+#             df = None
+#     if df is None:
+#         return "unknown", None, None, None
+#     df = df.head(1000)
+#     return "tabular", df_to_records(df.head(50)), df.shape, list(df.columns)[:50]
+# 
 
-def build_attachment_previews(files: List[UploadFile]) -> Tuple[Optional[str], List[AttachmentPreview]]:
+# pip install python-magic-bin charset-normalizer openpyxl pyarrow pdfplumber pillow lxml xmltodict
+def sniff_bytes(b: bytes, content_type: Optional[str] = None, filename: str = ""):
+    mt = content_type or magic.from_buffer(b, mime=True) or ""
+    # fallback by ext
+    ext = Path(filename).suffix.lower()
+    return mt, ext
+
+def decode_text(b: bytes) -> str:
+    best = from_bytes(b).best()
+    return (best.output() if best else b.decode("utf-8", "ignore"))
+
+def read_any(name: str, data: bytes, content_type: Optional[str]):
+    mime, ext = sniff_bytes(data, name, content_type)
+
+    # ---- TABLES
+    try:
+        if "csv" in mime or ext in {".csv", ".tsv"}:
+            txt = decode_text(data)
+            sniffer = csv.Sniffer()
+            dialect = sniffer.sniff(txt.splitlines(True)[0]) if txt else csv.excel
+            df = pd.read_csv(io.StringIO(txt), dialect=dialect)
+            return {"kind":"table","table_name":_sanitize_name(name), "df": df}
+        if "parquet" in mime or ext in {".parquet", ".pq"}:
+            import pyarrow.parquet as pq; import pyarrow as pa
+            table = pq.read_table(io.BytesIO(data))
+            return {"kind":"table","table_name":_sanitize_name(name), "df": table.to_pandas()}
+        if ext in {".feather"}:
+            import pyarrow.feather as feather
+            table = feather.read_feather(io.BytesIO(data))
+            return {"kind":"table","table_name":_sanitize_name(name), "df": table.to_pandas()}
+        if "excel" in mime or ext in {".xlsx", ".xls"}:
+            df = pd.read_excel(io.BytesIO(data))
+            return {"kind":"table","table_name":_sanitize_name(name), "df": df}
+        if "json" in mime or ext in {".json", ".ndjson"}:
+            text = decode_text(data)
+            # try ndjson first
+            if any(line.strip().startswith("{") for line in text.splitlines()[:5]):
+                try:
+                    df = pd.read_json(io.StringIO(text), lines=True)
+                    return {"kind":"table","table_name":_sanitize_name(name), "df": df}
+                except Exception:
+                    pass
+            obj = json.loads(text)
+            # normalize list-of-objects or nested dicts
+            df = pd.json_normalize(obj)
+            return {"kind":"table","table_name":_sanitize_name(name), "df": df}
+        if "html" in mime or ext in {".html", ".htm"}:
+            html = decode_text(data)
+            dfs = pd.read_html(html)
+            if dfs:
+                return {"kind":"table","table_name":_sanitize_name(name), "df": dfs[0]}
+            return {"kind":"html","text": html}
+        if "xml" in mime or ext in {".xml"}:
+            text = decode_text(data)
+            obj = xmltodict.parse(text)
+            df = pd.json_normalize(obj)
+            return {"kind":"table","table_name":_sanitize_name(name), "df": df}
+    except Exception:
+        pass
+
+    # ---- PDF (try tables)
+    if "pdf" in mime or ext == ".pdf":
+        try:
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                for page in pdf.pages[:2]:
+                    tbl = page.extract_table()
+                    if tbl:
+                        df = pd.DataFrame(tbl[1:], columns=tbl[0])
+                        return {"kind":"table","table_name":_sanitize_name(name), "df": df}
+            return {"kind":"binary","bytes": data, "mime": mime}
+        except Exception:
+            return {"kind":"binary","bytes": data, "mime": mime}
+
+    # ---- Images
+    if mime.startswith("image/") or ext in {".png",".jpg",".jpeg",".webp",".gif",".bmp",".tif",".tiff"}:
+        try:
+            Image.open(io.BytesIO(data))  # validate
+            return {"kind":"image","bytes": data, "mime": mime}
+        except Exception:
+            return {"kind":"binary","bytes": data, "mime": mime}
+
+    # ---- Text fallback
+    try:
+        text = decode_text(data)
+        if text.strip():
+            return {"kind":"text","text": text}
+    except Exception:
+        pass
+
+    # ---- Binary fallback
+    return {"kind":"binary","bytes": data, "mime": mime or "application/octet-stream"}
+
+def _ensure_str(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, bytes):
+        return x.decode("utf-8", errors="ignore")
+    if isinstance(x, str):
+        return x
+    # last resort – stringify other types
+    return str(x)
+
+def build_attachment_previews(files: List[UploadFile]) -> Tuple[Optional[str], List[AttachmentPreview], Dict[str, Any]]:
     """
-    Returns (question_text, previews)
-    - Detect question file automatically (filename contains 'question'/'questions'/'prompt' OR small text-like).
-    - The rest are attachments.
+    Returns (question_text, previews, attachment_tables)
+    - question_text: the detected question/prompt text (from one uploaded file)
+    - previews: lightweight AttachmentPreview objects for UI/LLM context
+    - attachment_tables: dict mapping table_name -> FULL pandas.DataFrame (no sampling)
+    This version relies on `read_any(name: str, data: bytes, content_type: Optional[str])`
+    to robustly sniff/parse inputs of many formats.
     """
     question_text: Optional[str] = None
     previews: List[AttachmentPreview] = []
+    attachment_tables: Dict[str, Any] = {}
 
-    # Read all files into memory once
+    # ---- Read all files into memory once (same as before)
     loaded: List[Tuple[UploadFile, bytes]] = []
     for f in files:
         content = f.file.read()
         f.file.seek(0)
         loaded.append((f, content))
 
-    # Heuristics to pick question
+    # ---- Heuristics to pick the question file (prefer explicit names)
     candidates = []
     for f, b in loaded:
         name = (f.filename or "").lower()
         ext = Path(name).suffix.lower()
+        # Strong signal by filename
         if any(k in name for k in ("question", "questions", "prompt")) and _is_probably_text(b):
-            candidates.append((0, f, b))  # strongest signal
+            candidates.append((0, f, b))
+        # Text-like and not too large
         elif ext in TEXT_EXTS and len(b) <= 256_000 and _is_probably_text(b):
             candidates.append((1, f, b))
         elif _is_probably_text(b) and len(b) <= 128_000:
@@ -436,54 +586,101 @@ def build_attachment_previews(files: List[UploadFile]) -> Tuple[Optional[str], L
             question_text = bq.decode("utf-8", errors="ignore").strip()
         except Exception:
             question_text = None
+        question_file = fq
+    else:
+        question_file = None
 
-    # Build previews for non-question files
+    # ---- Build previews using the universal sniffer; keep FULL tables
     for f, b in loaded:
-        if question_text and (f in [c[1] for c in candidates[:1]]):
+        # Skip the chosen question file
+        if question_file is not None and f is question_file:
             continue
+
         name = f.filename or "file"
-        ext = Path(name).suffix.lower()
-        kind = "unknown"
-        table_name = None
-        sample_text = None
-        sample_records = None
-        shape = None
-        columns = None
+        content_type = getattr(f, "content_type", None)
 
-        if ext in TABULAR_EXTS:
-            k, recs, shp, cols = _read_tabular_to_df(name, b, f.content_type)
-            if k == "tabular":
-                kind = "tabular"
-                table_name = _sanitize_name(name)
-                sample_records = recs
-                shape = shp
-                columns = cols
-        elif ext in HTML_EXTS:
-            try:
-                txt = b.decode("utf-8", errors="ignore")
-                sample_text = txt[:500]
-                kind = "html"
-            except Exception:
-                kind = "unknown"
-        elif ext in IMAGE_EXTS:
-            kind = "image"
-        elif _is_probably_text(b):
-            kind = "text"
-            sample_text = b.decode("utf-8", errors="ignore")[:500]
-        else:
-            kind = "unknown"
+        try:
+            parsed = read_any(name, b, content_type)  # <-- universal loader
+        except Exception:
+            parsed = {"kind": "binary", "bytes": b, "mime": content_type or "application/octet-stream"}
 
+        kind = parsed.get("kind", "unknown")
+
+        # Tabular: store the FULL DataFrame, and prepare a small preview for LLM/UI
+        if kind == "table":
+            df = parsed["df"]
+            table_name = parsed.get("table_name") or _sanitize_name(name)
+            attachment_tables[table_name] = df  # store FULL DF
+
+            previews.append(AttachmentPreview(
+                name=name,
+                table_name=table_name,
+                kind="tabular",
+                sample_text=None,  # not needed for tables
+                sample_records=df_to_records(df.head(50)),
+                shape=getattr(df, "shape", None),
+                columns=list(df.columns)[:50] if hasattr(df, "columns") else None
+            ))
+            continue
+
+        # ---- HTML detected but no table extracted
+        if kind == "html":
+            html_text = _ensure_str(parsed.get("text", ""))
+            mime = "text/html"
+            previews.append(AttachmentPreview(
+                name=name,
+                table_name=None,
+                kind="html",
+                sample_text=f"[mime: {mime}] " + (html_text[:500] if html_text else ""),
+                sample_records=None,
+                shape=None,
+                columns=None
+            ))
+            continue
+        
+        # ---- Plain text
+        if kind == "text":
+            text = _ensure_str(parsed.get("text", ""))
+            mime = "text/plain"
+            previews.append(AttachmentPreview(
+                name=name,
+                table_name=None,
+                kind="text",
+                sample_text=f"[mime: {mime}] " + (text[:500] if text else ""),
+                sample_records=None,
+                shape=None,
+                columns=None
+            ))
+            continue
+
+
+        # Image
+        if kind == "image":
+            mime = parsed.get("mime", "image/*")
+            previews.append(AttachmentPreview(
+                name=name,
+                table_name=None,
+                kind="image",
+                sample_text=f"[mime: {mime}]",
+                sample_records=None,
+                shape=None,
+                columns=None
+            ))
+            continue
+
+        # Fallback: unknown/binary
+        mime = parsed.get("mime", content_type or "application/octet-stream")
         previews.append(AttachmentPreview(
             name=name,
-            table_name=table_name,
-            kind=kind,
-            sample_text=sample_text,
-            sample_records=sample_records,
-            shape=shape,
-            columns=columns
+            table_name=None,
+            kind="unknown",
+            sample_text=f"[mime: {mime}] (binary)",
+            sample_records=None,
+            shape=None,
+            columns=None
         ))
 
-    return question_text, previews
+    return question_text, previews, attachment_tables
 
 def attachments_summary_for_llm(previews: List[AttachmentPreview]) -> str:
     lines = []
@@ -518,30 +715,26 @@ def build_attachment_tables(previews: List[AttachmentPreview]) -> Dict[str, Any]
                 continue
     return tables
 
+IO_INTENT_SYSTEM = """You output STRICT JSON:
+{"output_format": "string"}
+you are to provide a valid file format or valid output structure that best matches the user's wording. No commentary."""
+
 # ---- Output format detection -------------------------------------------------
 def detect_requested_format(question_text: str) -> Optional[str]:
-    """
-    Detects 'csv', 'json', 'markdown', 'md', 'text', or returns None if unspecified.
-    Also passes through custom schemas by returning None (so LLM can format from instructions).
-    """
-    ql = (question_text or "").lower()
-    # explicit patterns
-    if re.search(r"\b(output|format|return|give|provide|as)\b.*\bjson\b", ql):
-        return "json"
-    if re.search(r"\b(output|format|return|give|provide|as)\b.*\byaml\b", ql):
-        return "yaml"
-    if re.search(r"\b(output|format|return|give|provide|as)\b.*\bcsv\b", ql):
-        return "csv"
-    if re.search(r"\b(output|format|return|give|provide|as)\b.*\bxlxs\b", ql):
-        return "xlxs"
-    if re.search(r"\b(output|format|return|give|provide|as)\b.*\bpq\b", ql):
-        return "pq"
-    if re.search(r"\b(output|format|return|give|provide|as)\b.*\b(markdown|md)\b", ql):
-        return "markdown"
-    if re.search(r"\b(output|format|return|give|provide|as)\b.*\bplain\s*text\b", ql):
-        return "text"
-    return None
-
+    try:
+        raw = llm_call_raw(IO_INTENT_SYSTEM, question_text, FORMATTER_MODEL, temperature=0, max_tokens=120)
+        return coerce_json(extract_payload(raw))
+    except Exception:
+        # fallback: simple regex rules
+        fmt = "txt"
+        ql = (question_text or "").lower()
+        if "csv" in ql: fmt = "csv"
+        elif "json" in ql: fmt = "json"
+        elif "yaml" in ql or "yml" in ql: fmt = "yaml"
+        elif "excel" in ql or "xlsx" in ql: fmt = "xlsx"
+        elif "parquet" in ql: fmt = "parquet"
+        elif "markdown" in ql or "md" in ql: fmt = "markdown"
+        return {"output_format": fmt, "filename": None}
 # ---- Optimized executor -----------------------------------------------------
 exec(HELPERS, globals(), globals())
 
@@ -840,13 +1033,13 @@ def run_analysis_spec(spec: AnalysisSpec, attachment_tables: Dict[str, Any]) -> 
     return final_result
 
 # ---- Parallel API execution with 2 debug tries + fresh fallback -------------
-async def analyze_question_async(question: str, previews: List[AttachmentPreview], requested_format: Optional[str], debug: int = 0):
-    if not LLM_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY/LLM_API_KEY is not set.")
+async def analyze_question_async(question: str,
+                                 previews: List[AttachmentPreview],
+                                 attachment_tables: Dict[str, Any],
+                                 requested_format: Optional[str],
+                                 debug: int = 0):
 
     attachments_summary = attachments_summary_for_llm(previews)
-    attachment_tables = build_attachment_tables(previews)
-
     last_err: Optional[str] = None
 
     # Attempt 1: normal
@@ -938,13 +1131,14 @@ async def analyze_question(
             )
         raise HTTPException(status_code=400, detail="No files uploaded")
         
-    question_text, previews = build_attachment_previews(files)
+    question_text, previews, attachment_tables = build_attachment_previews(files)
     if not question_text:
         raise HTTPException(status_code=400, detail="Could not detect a question file.")
 
     requested_format = detect_requested_format(question_text)
-    return await analyze_question_async(question_text, previews, requested_format, debug)
-  
+    return await analyze_question_async(
+    question_text, previews, attachment_tables, requested_format, debug
+)  
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "version": "4.2.0-speed-optimized"}
@@ -979,3 +1173,4 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
