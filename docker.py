@@ -1098,14 +1098,29 @@ def compute_metrics(df_map: Dict[str, Any], metrics: List[MetricSpec], logs: Lis
                 elif m.op == "count": val = int(s.count())
                 out[m.result_key] = val
             elif m.op == "corr":
-                x = pd.to_numeric(df[m.args.get("x")], errors="coerce")
-                y = pd.to_numeric(df[m.args.get("y")], errors="coerce")
-                out[m.result_key] = float(x.corr(y))
+                x_col = m.args.get("x") or m.args.get("column1")
+                y_col = m.args.get("y") or m.args.get("column2")
+                
+                if not x_col or not y_col:
+                    logs.append(f"[metric] corr: missing column arguments")
+                    continue
+                    
+                x = pd.to_numeric(df[x_col], errors="coerce")
+                y = pd.to_numeric(df[y_col], errors="coerce")
+                out[m.result_key] = float(x.corr(y))     
+
             elif m.op in {"argmax_return","argmin_return"}:
-                by = pd.to_numeric(df[m.args.get("by")], errors="coerce")
-                ret = m.args.get("return_col")
+    # Handle different argument formats
+                by_col = m.args.get("by") or m.args.get("column")
+                ret_col = m.args.get("return_col") or "date"  # Default return column
+                
+                if not by_col:
+                    logs.append(f"[metric] {m.op}: missing by/column argument")
+                    continue
+                    
+                by = pd.to_numeric(df[by_col], errors="coerce")
                 idx = by.idxmax() if m.op == "argmax_return" else by.idxmin()
-                out[m.result_key] = None if (idx is None or (isinstance(idx, float) and pd.isna(idx))) else _ensure_str(df.loc[idx, ret])
+                out[m.result_key] = None if (idx is None or (isinstance(idx, float) and pd.isna(idx))) else _ensure_str(df.loc[idx, ret_col])
             elif m.op == "expr":
                 expr = m.args.get("expr", "")
                 out_type = (m.args.get("type") or "float").lower()
