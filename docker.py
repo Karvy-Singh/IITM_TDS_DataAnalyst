@@ -1,49 +1,3 @@
-Hugging Face's logo
-Hugging Face
-Models
-Datasets
-Spaces
-Community
-Docs
-Enterprise
-Pricing
-
-
-
-Spaces:
-
-KarvySingh
-/
-DataAnalyst
-
-
-like
-0
-
-Logs
-App
-Files
-Community
-Settings
-DataAnalyst
-/
-app.py
-
-KarvySingh's picture
-KarvySingh
-Update app.py
-d0e99a4
-verified
-less than a minute ago
-raw
-
-Copy download link
-history
-blame
-edit
-delete
-
-45.2 kB
 import os
 import re
 import json
@@ -59,6 +13,9 @@ import magic, io, csv, json, pandas as pd, numpy as np
 from charset_normalizer import from_bytes
 import pdfplumber, xmltodict
 from PIL import Image
+
+from typing import Literal
+from pydantic import Field
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -81,6 +38,33 @@ if not LLM_API_KEY:
 client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
 app = FastAPI(title="Universal Data Analyst (speed-optimized)", version="4.2.0")
+
+import copy
+
+def strip_payload_for_llm(final_structured: dict) -> dict:
+    slim = copy.deepcopy(final_structured)
+
+    # Replace image URIs with lightweight placeholders
+    if "images" in slim:
+        slim["images"] = {k: f"[image:{k}]" for k in slim["images"].keys()}
+
+    # (Optional) shrink tables so you don’t leak lots of rows into the prompt
+    if "tables" in slim:
+        slim["tables"] = {
+            name: {"preview_sample_cols": list(rows[0].keys()) if rows else [], "rows_previewed": len(rows)}
+            for name, rows in slim["tables"].items()
+        }
+    return slim
+
+def inject_images(text: str, images: Dict[str, str]) -> str:
+    # Make sure the data URIs are single-line and well-formed
+    def sanitize(uri: str) -> str:
+        uri = uri.replace("\n", "").replace("\r", "").strip()
+        return uri if uri.startswith("data:image/") else f"data:image/png;base64,{uri}"
+    for k, uri in (images or {}).items():
+        text = text.replace(f"[image:{k}]", sanitize(uri))
+    return text
+
 
 # ---- Prompts ----------------------------------------------------------------
 # Simplified planner for faster processing
@@ -145,9 +129,28 @@ Schema (must validate exactly):
           "x": {"type":["string","null"]},
           "y": {"type":["string","array","null"]},
           "title": {"type":["string","null"]},
-          "bins": {"type":["integer","null"]}
+          "bins": {"type":["integer","null"]},
+          "result_key": {"type":["string","null"]},
+          "color": {"type":["string","null"]}
         },
         "required": ["table","kind"],
+        "additionalProperties": false
+      }
+    },
+    "metrics": {
+      "type":"array",
+      "items": {
+        "type":"object",
+        "properties": {
+          "table": {"type":"string"},
+          "op": {"type":"string","enum":[
+            "mean","min","max","sum","median","std","nunique","count",
+            "corr","argmax_return","argmin_return","expr"
+          ]},
+          "args": {"type":"object"},
+          "result_key": {"type":"string"}
+        },
+        "required": ["table","op","args","result_key"],
         "additionalProperties": false
       }
     },
@@ -163,10 +166,14 @@ Schema (must validate exactly):
     },
     "result_table": {"type":"string"}
   },
-  "required": ["inputs","transforms","charts","answer","result_table"],
+  "required": ["inputs","transforms","charts","metrics","answer","result_table"],
   "additionalProperties": false
 }
-Minimize transforms. Prefer simple operations. Return JSON only."""
+Guidelines:
+- Keep transforms minimal.
+- If the user specifies exact output keys (e.g., "Return a JSON with keys ..."), create metrics with matching `result_key` names and charts with matching `result_key` names for any image keys.
+- Use simple, robust ops (mean/min/max/sum/corr/argmax_return/argmin_return). Use `expr` only when necessary for a scalar result.
+Return JSON only."""
 
 # Simplified formatter for speed — respects requested output format
 OUTPUT_FORMATTER_SYSTEM = """
@@ -230,6 +237,21 @@ def fig_to_data_uri(fig):
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=72)  # Lower DPI for speed
     plt.close(fig)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+def fig_to_data_uri_sized(fig, size_candidates=(72, 60, 48), max_bytes=100*1024):
+    import io, base64
+    for dpi in size_candidates:
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", dpi=dpi)
+        data = buf.getvalue()
+        if len(data) <= max_bytes:
+            plt_close = True
+            break
+    else:
+        # fallback: accept the smallest even if > max_bytes
+        data = buf.getvalue()
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+    return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
 """
 
 # ---- Models / Validators -----------------------------------------------------
@@ -255,11 +277,30 @@ class Transform(BaseModel):
 
 class ChartSpec(BaseModel):
     table: str
-    kind: str
+    kind: str  # "line" | "bar" | "scatter" | "hist"
     x: Optional[str] = None
     y: Optional[Any] = None
     title: Optional[str] = None
     bins: Optional[int] = None
+    # NEW: allow the LLM to name the output image key and optionally a color
+    result_key: Optional[str] = None
+    color: Optional[str] = None
+
+class MetricSpec(BaseModel):
+    table: str
+    op: Literal[
+        "mean","min","max","sum","median","std","nunique","count",
+        "corr","argmax_return","argmin_return","expr"
+    ]
+    # args:
+    # - column: for mean/min/max/sum/median/std/nunique/count
+    # - x,y: for corr
+    # - by, return_col: for argmax_return/argmin_return
+    # - expr: pandas-compatible scalar expression for "expr" (e.g., "temperature_c.mean()")
+    # - type: "float"|"int"|"str" (coercion for expr output)
+    args: Dict[str, Any] = Field(default_factory=dict)
+    # Where to place the computed value in final_result["metrics"]
+    result_key: str
 
 class AnswerSpec(BaseModel):
     type: str  # "text_summary" | "basic_stats" | "none"
@@ -270,8 +311,12 @@ class AnalysisSpec(BaseModel):
     inputs: List[AnalysisInput]
     transforms: List[Transform]
     charts: List[ChartSpec]
+    # NEW: optional list of metrics (defaults to [])
+    metrics: List[MetricSpec] = Field(default_factory=list)
     answer: AnswerSpec
     result_table: str
+
+
 
 # ---- Utilities ---------------------------------------------------------------
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
@@ -455,8 +500,7 @@ def decode_text(b: bytes) -> str:
     return (best.output() if best else b.decode("utf-8", "ignore"))
 
 def read_any(name: str, data: bytes, content_type: Optional[str]):
-    mime, ext = sniff_bytes(data, name, content_type)
-
+    mime, ext = sniff_bytes(data, content_type, name)
     # ---- TABLES
     try:
         if "csv" in mime or ext in {".csv", ".tsv"}:
@@ -864,50 +908,111 @@ def apply_transform(df_map: Dict[str, Any], t: Transform, logs: List[str]) -> No
     except Exception as e:
         logs.append(f"[transform] {t.op} error: {e}")
 
-def render_charts(df_map: Dict[str, Any], charts: List[ChartSpec], logs: List[str]) -> List[str]:
-    if not charts:  # Skip if no charts requested
-        return []
-    
-    images: List[str] = []
+def render_charts(df_map: Dict[str, Any], charts: List[ChartSpec], logs: List[str]) -> Dict[str, str]:
+    if not charts:
+        return {}
+
+    images: Dict[str, str] = {}
     import matplotlib
-    matplotlib.use('Agg')  # Non-interactive backend for speed
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    
-    for ch in charts[:3]:  # Limit to 3 charts max for speed
+
+    for ch in charts[:5]:  # small cap
         if ch.table not in df_map:
             logs.append(f"[chart] missing table {ch.table}")
             continue
-        df = df_map[ch.table].head(200)  # Limit data points for speed
+        df = df_map[ch.table].head(500)
         try:
-            fig, ax = plt.subplots(figsize=(6, 4))  # Smaller figures
-            
+            fig, ax = plt.subplots(figsize=(5, 3))
+            color = ch.color  # may be None
             if ch.kind == "line":
                 if isinstance(ch.y, list):
-                    for col in ch.y[:3]:  # Max 3 series
-                        ax.plot(df[ch.x], df[col], label=col)
+                    for col in ch.y[:3]:
+                        ax.plot(df[ch.x], df[col], label=col, color=color)
                     ax.legend()
                 else:
-                    ax.plot(df[ch.x], df[ch.y])
+                    ax.plot(df[ch.x], df[ch.y], color=color)
+                ax.set_xlabel(ch.x or "")
+                ax.set_ylabel(",".join(ch.y) if isinstance(ch.y, list) else (ch.y or ""))
             elif ch.kind == "bar":
                 ycol = ch.y if isinstance(ch.y, str) else (ch.y[0] if ch.y else None)
-                ax.bar(df[ch.x], df[ycol])
+                ax.bar(df[ch.x], df[ycol], color=color)
+                ax.set_xlabel(ch.x or "")
+                ax.set_ylabel(ycol or "")
             elif ch.kind == "scatter":
                 ycol = ch.y if isinstance(ch.y, str) else (ch.y[0] if ch.y else None)
-                ax.scatter(df[ch.x], df[ycol], alpha=0.6, s=20)  # Smaller markers
+                ax.scatter(df[ch.x], df[ycol], alpha=0.6, s=20, color=color)
+                ax.set_xlabel(ch.x or "")
+                ax.set_ylabel(ycol or "")
             elif ch.kind == "hist":
                 ycol = ch.y if isinstance(ch.y, str) else (ch.y[0] if ch.y else None)
-                bins = min(ch.bins or 20, 20)  # Limit bins
-                ax.hist(df[ycol], bins=bins)
-            
-            if ch.title: 
+                bins = min(ch.bins or 20, 50)
+                ax.hist(df[ycol], bins=bins, color=color)
+                ax.set_xlabel(ycol or "")
+                ax.set_ylabel("count")
+            if ch.title:
                 ax.set_title(ch.title)
-            
-            images.append(fig_to_data_uri(fig))
-            logs.append(f"[chart] {ch.kind} on {ch.table}")
+
+            uri = fig_to_data_uri(fig)
+            key = ch.result_key or f"chart_{len(images)+1}"
+            images[key] = uri
+            logs.append(f"[chart] {ch.kind} -> {key}")
         except Exception as e:
             logs.append(f"[chart] error: {e}")
-    
     return images
+
+def compute_metrics(df_map: Dict[str, Any], metrics: List[MetricSpec], logs: List[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    import pandas as pd
+    for m in metrics[:50]:
+        if m.table not in df_map:
+            logs.append(f"[metric] missing table {m.table}")
+            continue
+        df = df_map[m.table]
+        try:
+            if m.op in {"mean","min","max","sum","median","std","nunique","count"}:
+                col = m.args.get("column")
+                s = pd.to_numeric(df[col], errors="coerce") if col else None
+                if m.op == "mean": val = float(s.mean())
+                elif m.op == "min": val = float(s.min())
+                elif m.op == "max": val = float(s.max())
+                elif m.op == "sum": val = float(s.sum())
+                elif m.op == "median": val = float(s.median())
+                elif m.op == "std": val = float(s.std())
+                elif m.op == "nunique": val = int(s.nunique(dropna=True))
+                elif m.op == "count": val = int(s.count())
+                out[m.result_key] = val
+            elif m.op == "corr":
+                x = pd.to_numeric(df[m.args.get("x")], errors="coerce")
+                y = pd.to_numeric(df[m.args.get("y")], errors="coerce")
+                out[m.result_key] = float(x.corr(y))
+            elif m.op in {"argmax_return","argmin_return"}:
+                by = pd.to_numeric(df[m.args.get("by")], errors="coerce")
+                ret = m.args.get("return_col")
+                idx = by.idxmax() if m.op == "argmax_return" else by.idxmin()
+                out[m.result_key] = None if (idx is None or (isinstance(idx, float) and pd.isna(idx))) else _ensure_str(df.loc[idx, ret])
+            elif m.op == "expr":
+                expr = m.args.get("expr", "")
+                out_type = (m.args.get("type") or "float").lower()
+                # safe eval context
+                local = {c: pd.to_numeric(df[c], errors="coerce") if pd.api.types.is_numeric_dtype(df[c]) else df[c] for c in df.columns}
+                val = pd.eval(expr, engine="python", parser="pandas", target=local)
+                if hasattr(val, "item"):
+                    val = val.item()
+                if out_type == "int":
+                    try: val = int(val)
+                    except: val = None
+                elif out_type == "float":
+                    try: val = float(val)
+                    except: val = None
+                else:
+                    val = _ensure_str(val)
+                out[m.result_key] = val
+            logs.append(f"[metric] {m.op} -> {m.result_key}")
+        except Exception as e:
+            logs.append(f"[metric] error on {m.result_key}: {e}")
+    return out
+
 
 def summarize(answer: AnswerSpec, df_map: Dict[str, Any], logs: List[str]) -> Any:
     if answer.type == "none":
@@ -989,49 +1094,46 @@ def make_fresh_spec_from_attachments(question: str, previews: List[AttachmentPre
 # ---- Optimized pipeline execution -------------------------------------------
 def run_analysis_spec(spec: AnalysisSpec, attachment_tables: Dict[str, Any]) -> Dict[str, Any]:
     logs: List[str] = []
-    
+
     # Load inputs (with parallel fetching)
     tables = load_inputs(spec.inputs, logs)
 
-    # Merge in attachment tables (always available by table_name)
+    # Inject attachments by table_name
     for k, v in attachment_tables.items():
-        if k not in tables:
-            tables[k] = v
-            logs.append(f"[inputs] attachment injected: {k} shape={getattr(v,'shape',None)}")
-    
-    # Apply transforms sequentially (but limited)
-    for t in spec.transforms[:10]:  # Limit transforms for speed
+        tables[k] = v  # overwrite inline stub with full data
+        logs.append(f"[inputs] attachment injected (overwrote/added): {k} shape={getattr(v,'shape',None)}")
+
+    # Transforms
+    for t in spec.transforms[:10]:
         apply_transform(tables, t, logs)
-    
-    # Build images (limited)
-    images = render_charts(tables, spec.charts, logs)
-    
-    # Choose result table
-    res_name = spec.result_table
-    if res_name not in tables and tables:
-        res_name = next(iter(tables.keys()))
-    
-    # Prepare tables output (smaller previews)
+
+    # Charts (now keyed)
+    images_by_key = render_charts(tables, spec.charts, logs)
+
+    # Metrics (now computed!)
+    metrics = compute_metrics(tables, spec.metrics, logs)
+
+    # Pick a result table
+    res_name = spec.result_table if spec.result_table in tables else (next(iter(tables.keys())) if tables else "result")
+
+    # Small previews only
     tables_out: Dict[str, List[Dict[str, Any]]] = {}
     for name, df in tables.items():
         try:
-            preview = df.head(50)  # Much smaller preview
-            tables_out[name] = df_to_records(preview)
+            tables_out[name] = df_to_records(df.head(50))
         except Exception:
             tables_out[name] = []
-    
-    # Generate answer
+
+    # Optional built-in answer
     ans = summarize(spec.answer, tables, logs)
-    
-    final_result = {
+
+    return {
         "answer": ans,
         "tables": {res_name: tables_out.get(res_name, [])},
-        "images": images,
+        "images": images_by_key,   # dict[str -> data URI]
+        "metrics": metrics,        # dict[str -> scalar or str]
         "logs": logs,
     }
-    
-    return final_result
-
 # ---- Parallel API execution with 2 debug tries + fresh fallback -------------
 async def analyze_question_async(question: str,
                                  previews: List[AttachmentPreview],
@@ -1047,15 +1149,21 @@ async def analyze_question_async(question: str,
         debug_hint = None if attempt == 1 else f"Previous error: {last_err}. Prefer using the provided attachments via inline inputs. Avoid network fetches."
         try:
             # Step 1: Plan (fast)
-            plan = plan_question(question if attempt == 1 else f"{question}\n\n(You have attachments. See list below.)\n{attachments_summary}")
+            # Replace the conditional with this:
+            print(question)
+            print(attachments_summary)
+            plan = plan_question(f"{question}\n\n(You have attachments. See list below.)\n{attachments_summary}")
+
             # Step 2: Generate spec (single attempt)
             spec = generate_analysis_spec(plan, attachments_summary, debug_hint=debug_hint)
             # Step 3: Execute spec
             final_structured = run_analysis_spec(spec, attachment_tables)
+            print(final_structured)
             final_structured = validate_final_result(final_structured)
-            # Step 4: Format output (with requested format)
-            fmt_prompt = make_formatter_prompt(question, final_structured, requested_format)
+            structured_for_llm = strip_payload_for_llm(final_structured)
+            fmt_prompt = make_formatter_prompt(question, structured_for_llm, requested_format)
             formatted = llm_call_raw(OUTPUT_FORMATTER_SYSTEM, fmt_prompt, FORMATTER_MODEL, temperature=0, max_tokens=500)
+            print(formatted)
             if debug == 1:
                 return JSONResponse({
                     "ok": True,
@@ -1069,6 +1177,7 @@ async def analyze_question_async(question: str,
                         "attachments": [p.model_dump() for p in previews]
                     }
                 })
+            formatted = inject_images(formatted, final_structured.get("images"))
             return Response(formatted, media_type="text/plain")
         except Exception as e:
             last_err = str(e)
@@ -1077,9 +1186,12 @@ async def analyze_question_async(question: str,
     try:
         spec = make_fresh_spec_from_attachments(question, previews)
         final_structured = run_analysis_spec(spec, attachment_tables)
+        print(final_structured)
         final_structured = validate_final_result(final_structured)
-        fmt_prompt = make_formatter_prompt(question, final_structured, requested_format)
+        structured_for_llm = strip_payload_for_llm(final_structured)
+        fmt_prompt = make_formatter_prompt(question, structured_for_llm, requested_format)
         formatted = llm_call_raw(OUTPUT_FORMATTER_SYSTEM, fmt_prompt, FORMATTER_MODEL, temperature=0, max_tokens=500)
+        print(formatted)
         if debug == 1:
             return JSONResponse({
                 "ok": True,
@@ -1093,6 +1205,7 @@ async def analyze_question_async(question: str,
                     "attachments": [p.model_dump() for p in previews]
                 }
             })
+        formatted = inject_images(formatted, final_structured.get("images"))
         return Response(formatted, media_type="text/plain")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"All attempts failed. Last error: {last_err} | Fresh fallback error: {e}")
@@ -1173,4 +1286,3 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
