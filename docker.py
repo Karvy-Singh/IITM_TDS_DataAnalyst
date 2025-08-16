@@ -395,7 +395,7 @@ def make_coder_prompt(plan: Plan, attachments_summary: str, debug_hint: Optional
     hint = f"\nDEBUG_HINT: {debug_hint}" if debug_hint else ""
     return (
         f"Question: {plan.question}\n"
-        f"Plan: {plan.model_dump_json()}\n"
+        f"Plan: {plan.json()}\n"
         f"Attachments available (prefer using them with source='inline' and their table names):\n{attachments_summary}\n"
         "When referencing attachments, set inputs[].source='inline' and inputs[].data to a SMALL sample (we will provide full data at execution time)."
         f"{hint}\n"
@@ -499,76 +499,149 @@ def decode_text(b: bytes) -> str:
     best = from_bytes(b).best()
     return (best.output() if best else b.decode("utf-8", "ignore"))
 
+
 def read_any(name: str, data: bytes, content_type: Optional[str]):
+    """
+    Robust file sniffer/loader. Returns one of:
+      - {"kind":"table", "table_name": <safe>, "df": <pd.DataFrame>}
+      - {"kind":"image", "bytes": data, "mime": mime}
+      - {"kind":"html", "text": html}
+      - {"kind":"text", "text": text}
+      - {"kind":"binary","bytes": data, "mime": mime}
+    """
+    import io, json
+    from typing import Optional
+    import pandas as pd
+
+    # --- helpers
+    def _lower(s): return (s or "").lower()
+    def _has_ext(n, exts): 
+        n = (n or "").lower()
+        return any(n.endswith(e) for e in exts)
+    def _safe_name(n):
+        return _sanitize_name(n) if "_sanitize_name" in globals() else (n or "table").replace(".", "_")
+
     mime, ext = sniff_bytes(data, content_type, name)
-    # ---- TABLES
+    mime_l = _lower(mime)
+    ext_l  = _lower(ext)
+# ============= 1) CSV/TSV — do this FIRST and return early  =============
+    # Conditions: explicit CSV/TSV extension, CSV-y mime, OR the bytes look csv-ish.
+    looks_csvish = False
     try:
-        if "csv" in mime or ext in {".csv", ".tsv"}:
-            txt = decode_text(data)
-            sniffer = csv.Sniffer()
-            dialect = sniffer.sniff(txt.splitlines(True)[0]) if txt else csv.excel
-            df = pd.read_csv(io.StringIO(txt), dialect=dialect)
-            return {"kind":"table","table_name":_sanitize_name(name), "df": df}
-        if "parquet" in mime or ext in {".parquet", ".pq"}:
-            import pyarrow.parquet as pq; import pyarrow as pa
-            table = pq.read_table(io.BytesIO(data))
-            return {"kind":"table","table_name":_sanitize_name(name), "df": table.to_pandas()}
-        if ext in {".feather"}:
-            import pyarrow.feather as feather
-            table = feather.read_feather(io.BytesIO(data))
-            return {"kind":"table","table_name":_sanitize_name(name), "df": table.to_pandas()}
-        if "excel" in mime or ext in {".xlsx", ".xls"}:
-            df = pd.read_excel(io.BytesIO(data))
-            return {"kind":"table","table_name":_sanitize_name(name), "df": df}
-        if "json" in mime or ext in {".json", ".ndjson"}:
-            text = decode_text(data)
-            # try ndjson first
-            if any(line.strip().startswith("{") for line in text.splitlines()[:5]):
-                try:
-                    df = pd.read_json(io.StringIO(text), lines=True)
-                    return {"kind":"table","table_name":_sanitize_name(name), "df": df}
-                except Exception:
-                    pass
-            obj = json.loads(text)
-            # normalize list-of-objects or nested dicts
-            df = pd.json_normalize(obj)
-            return {"kind":"table","table_name":_sanitize_name(name), "df": df}
-        if "html" in mime or ext in {".html", ".htm"}:
-            html = decode_text(data)
-            dfs = pd.read_html(html)
-            if dfs:
-                return {"kind":"table","table_name":_sanitize_name(name), "df": dfs[0]}
-            return {"kind":"html","text": html}
-        if "xml" in mime or ext in {".xml"}:
-            text = decode_text(data)
-            obj = xmltodict.parse(text)
-            df = pd.json_normalize(obj)
-            return {"kind":"table","table_name":_sanitize_name(name), "df": df}
+        # Peek just a little to avoid decoding huge blobs; decode defensively.
+        head_text = decode_text(data[:4096] if isinstance(data, (bytes, bytearray)) else data)
+        if head_text:
+            # simple heuristic for delimited text
+            first_line = head_text.splitlines()[0] if head_text.splitlines() else ""
+            looks_csvish = ("," in first_line or "\t" in first_line) and len(first_line.split(",")) + len(first_line.split("\t")) > 1
     except Exception:
         pass
 
-    # ---- PDF (try tables)
-    if "pdf" in mime or ext == ".pdf":
+    if ext_l in {".csv", ".tsv"} or "csv" in mime_l or _has_ext(name, [".csv", ".tsv"]) or looks_csvish:
         try:
+            # decode to text (handles BOM); NEVER feed text into BytesIO
+            txt = decode_text(data)
+            if not txt.strip():
+                raise ValueError("Empty CSV text.")
+
+            # Prefer auto-sniff unless it's clearly TSV
+            # pandas: sep=None requires engine='python' for sniffing
+            if ext_l == ".tsv":
+                df = pd.read_csv(io.StringIO(txt.lstrip("\ufeff")), sep="\t")
+            else:
+                try:
+                    df = pd.read_csv(io.StringIO(txt.lstrip("\ufeff")), sep=None, engine="python")
+                except Exception:
+                    # fallback to comma, then tab
+                    try:
+                        df = pd.read_csv(io.StringIO(txt.lstrip("\ufeff")), sep=",")
+                    except Exception:
+                        df = pd.read_csv(io.StringIO(txt.lstrip("\ufeff")), sep="\t")
+
+            # sanity: require at least 1 column
+            if getattr(df, "shape", (0, 0))[1] == 0:
+                raise ValueError("Parsed CSV had 0 columns.")
+
+            return {"kind": "table", "table_name": _safe_name(name), "df": df}
+        except Exception as e:
+            print(f"CSV parsing failed for {name}: {e}")  # keep your debug, but don't abort
+    # ============= 2) Columnar & spreadsheets  =============
+    try:
+        if "parquet" in mime_l or ext_l in {".parquet", ".pq"}:
+            import pyarrow.parquet as pq
+            table = pq.read_table(io.BytesIO(data))
+            return {"kind":"table","table_name":_safe_name(name), "df": table.to_pandas()}
+
+        if ext_l in {".feather"}:
+            import pyarrow.feather as feather
+            table = feather.read_feather(io.BytesIO(data))
+            return {"kind":"table","table_name":_safe_name(name), "df": table.to_pandas()}
+
+        if "excel" in mime_l or ext_l in {".xlsx", ".xls"}:
+            df = pd.read_excel(io.BytesIO(data))
+            return {"kind":"table","table_name":_safe_name(name), "df": df}
+
+        if "json" in mime_l or ext_l in {".json", ".ndjson"}:
+            import pandas as pd, json
+            text = decode_text(data)
+            # Try NDJSON first (lines of JSON objects)
+            head = "\n".join(text.splitlines()[:5])
+            if any(line.strip().startswith("{") for line in head.splitlines()):
+                try:
+                    df = pd.read_json(io.StringIO(text), lines=True)
+                    return {"kind":"table","table_name":_safe_name(name), "df": df}
+                except Exception:
+                    pass
+            obj = json.loads(text)
+            df = pd.json_normalize(obj)
+            return {"kind":"table","table_name":_safe_name(name), "df": df}
+
+        if "html" in mime_l or ext_l in {".html", ".htm"}:
+            html = decode_text(data)
+            try:
+                dfs = pd.read_html(html)
+                if dfs:
+                    return {"kind":"table","table_name":_safe_name(name), "df": dfs[0]}
+            except Exception:
+                pass
+            return {"kind":"html","text": html}
+
+        if "xml" in mime_l or ext_l in {".xml"}:
+            import xmltodict
+            text = decode_text(data)
+            obj = xmltodict.parse(text)
+            df = pd.json_normalize(obj)
+            return {"kind":"table","table_name":_safe_name(name), "df": df}
+    except Exception:
+        # fall through to other handlers
+        pass
+
+    # ============= 3) PDF (try to extract simple tables)  =============
+    if "pdf" in mime_l or ext_l == ".pdf":
+        try:
+            import pdfplumber, pandas as pd
             with pdfplumber.open(io.BytesIO(data)) as pdf:
                 for page in pdf.pages[:2]:
-                    tbl = page.extract_table()
-                    if tbl:
-                        df = pd.DataFrame(tbl[1:], columns=tbl[0])
-                        return {"kind":"table","table_name":_sanitize_name(name), "df": df}
+                    # try multiple tables per page
+                    tables = page.extract_tables() or []
+                    for tbl in tables:
+                        if tbl and len(tbl) > 1:
+                            df = pd.DataFrame(tbl[1:], columns=tbl[0])
+                            return {"kind":"table","table_name":_safe_name(name), "df": df}
             return {"kind":"binary","bytes": data, "mime": mime}
         except Exception:
             return {"kind":"binary","bytes": data, "mime": mime}
 
-    # ---- Images
-    if mime.startswith("image/") or ext in {".png",".jpg",".jpeg",".webp",".gif",".bmp",".tif",".tiff"}:
+    # ============= 4) Images  =============
+    if mime_l.startswith("image/") or ext_l in {".png",".jpg",".jpeg",".webp",".gif",".bmp",".tif",".tiff"}:
         try:
+            from PIL import Image
             Image.open(io.BytesIO(data))  # validate
             return {"kind":"image","bytes": data, "mime": mime}
         except Exception:
             return {"kind":"binary","bytes": data, "mime": mime}
 
-    # ---- Text fallback
+    # ============= 5) Text fallback  =============
     try:
         text = decode_text(data)
         if text.strip():
@@ -576,8 +649,10 @@ def read_any(name: str, data: bytes, content_type: Optional[str]):
     except Exception:
         pass
 
-    # ---- Binary fallback
+    # ============= 6) Binary fallback  =============
     return {"kind":"binary","bytes": data, "mime": mime or "application/octet-stream"}
+
+
 
 def _ensure_str(x) -> str:
     if x is None:
@@ -591,33 +666,29 @@ def _ensure_str(x) -> str:
 
 def build_attachment_previews(files: List[UploadFile]) -> Tuple[Optional[str], List[AttachmentPreview], Dict[str, Any]]:
     """
-    Returns (question_text, previews, attachment_tables)
-    - question_text: the detected question/prompt text (from one uploaded file)
-    - previews: lightweight AttachmentPreview objects for UI/LLM context
-    - attachment_tables: dict mapping table_name -> FULL pandas.DataFrame (no sampling)
-    This version relies on `read_any(name: str, data: bytes, content_type: Optional[str])`
-    to robustly sniff/parse inputs of many formats.
+    Fixed version that properly handles file reading and processing
     """
     question_text: Optional[str] = None
     previews: List[AttachmentPreview] = []
     attachment_tables: Dict[str, Any] = {}
 
-    # ---- Read all files into memory once (same as before)
-    loaded: List[Tuple[UploadFile, bytes]] = []
-    for f in files:
+    # Read all files into memory once
+    loaded: List[Tuple[UploadFile, bytes]] = [] 
+    for f in files: 
         content = f.file.read()
-        f.file.seek(0)
+        # Ensure content is bytes
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        f.file.seek(0) 
         loaded.append((f, content))
 
-    # ---- Heuristics to pick the question file (prefer explicit names)
+    # Heuristics to pick the question file
     candidates = []
     for f, b in loaded:
         name = (f.filename or "").lower()
         ext = Path(name).suffix.lower()
-        # Strong signal by filename
         if any(k in name for k in ("question", "questions", "prompt")) and _is_probably_text(b):
             candidates.append((0, f, b))
-        # Text-like and not too large
         elif ext in TEXT_EXTS and len(b) <= 256_000 and _is_probably_text(b):
             candidates.append((1, f, b))
         elif _is_probably_text(b) and len(b) <= 128_000:
@@ -634,9 +705,8 @@ def build_attachment_previews(files: List[UploadFile]) -> Tuple[Optional[str], L
     else:
         question_file = None
 
-    # ---- Build previews using the universal sniffer; keep FULL tables
+    # Process each file and store FULL DataFrames
     for f, b in loaded:
-        # Skip the chosen question file
         if question_file is not None and f is question_file:
             continue
 
@@ -644,85 +714,65 @@ def build_attachment_previews(files: List[UploadFile]) -> Tuple[Optional[str], L
         content_type = getattr(f, "content_type", None)
 
         try:
-            parsed = read_any(name, b, content_type)  # <-- universal loader
-        except Exception:
+            # CRITICAL FIX: Ensure b is bytes, not string
+            if isinstance(b, str):
+                b = b.encode("utf-8")
+            parsed = read_any(name, b, content_type)
+        except Exception as e:
+            print(f"Error parsing {name}: {e}")  # Debug print
             parsed = {"kind": "binary", "bytes": b, "mime": content_type or "application/octet-stream"}
 
         kind = parsed.get("kind", "unknown")
 
-        # Tabular: store the FULL DataFrame, and prepare a small preview for LLM/UI
+        # CRITICAL FIX: Store FULL DataFrame in attachment_tables
         if kind == "table":
             df = parsed["df"]
             table_name = parsed.get("table_name") or _sanitize_name(name)
-            attachment_tables[table_name] = df  # store FULL DF
-
+            
+            # Store the FULL DataFrame (not just preview)
+            attachment_tables[table_name] = df
+            
+            # Create preview for LLM
             previews.append(AttachmentPreview(
                 name=name,
                 table_name=table_name,
-                kind="tabular",
-                sample_text=None,  # not needed for tables
-                sample_records=df_to_records(df.head(50)),
-                shape=getattr(df, "shape", None),
+                kind="tabular",  # Use "tabular" not "table" to match the enum
+                sample_text=None,
+                sample_records=df_to_records(df.head(50)),  # Just preview
+                shape=df.shape,
                 columns=list(df.columns)[:50] if hasattr(df, "columns") else None
             ))
             continue
 
-        # ---- HTML detected but no table extracted
+        # Handle other file types (HTML, text, images, etc.)
         if kind == "html":
             html_text = _ensure_str(parsed.get("text", ""))
-            mime = "text/html"
             previews.append(AttachmentPreview(
-                name=name,
-                table_name=None,
-                kind="html",
-                sample_text=f"[mime: {mime}] " + (html_text[:500] if html_text else ""),
-                sample_records=None,
-                shape=None,
-                columns=None
+                name=name, table_name=None, kind="html",
+                sample_text=f"[HTML] " + (html_text[:500] if html_text else ""),
+                sample_records=None, shape=None, columns=None
             ))
-            continue
-        
-        # ---- Plain text
-        if kind == "text":
+        elif kind == "text":
             text = _ensure_str(parsed.get("text", ""))
-            mime = "text/plain"
             previews.append(AttachmentPreview(
-                name=name,
-                table_name=None,
-                kind="text",
-                sample_text=f"[mime: {mime}] " + (text[:500] if text else ""),
-                sample_records=None,
-                shape=None,
-                columns=None
+                name=name, table_name=None, kind="text",
+                sample_text=f"[TEXT] " + (text[:500] if text else ""),
+                sample_records=None, shape=None, columns=None
             ))
-            continue
-
-
-        # Image
-        if kind == "image":
+        elif kind == "image":
             mime = parsed.get("mime", "image/*")
             previews.append(AttachmentPreview(
-                name=name,
-                table_name=None,
-                kind="image",
-                sample_text=f"[mime: {mime}]",
-                sample_records=None,
-                shape=None,
-                columns=None
+                name=name, table_name=None, kind="image",
+                sample_text=f"[IMAGE: {mime}]",
+                sample_records=None, shape=None, columns=None
             ))
-            continue
-
-        # Fallback: unknown/binary
-        mime = parsed.get("mime", content_type or "application/octet-stream")
-        previews.append(AttachmentPreview(
-            name=name,
-            table_name=None,
-            kind="unknown",
-            sample_text=f"[mime: {mime}] (binary)",
-            sample_records=None,
-            shape=None,
-            columns=None
-        ))
+        else:
+            mime = parsed.get("mime", content_type or "application/octet-stream")
+            previews.append(AttachmentPreview(
+                name=name, table_name=None, kind="unknown",
+                sample_text=f"[BINARY: {mime}]",
+                sample_records=None, shape=None, columns=None
+            ))
 
     return question_text, previews, attachment_tables
 
@@ -790,48 +840,113 @@ ALLOWED_OPS = {
 def load_inputs(inputs: List[AnalysisInput], logs: List[str]) -> Dict[str, Any]:
     tables: Dict[str, Any] = {}
     
-    # Parallel loading for multiple inputs
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        future_to_input = {}
-        
-        for inp in inputs:
-            if inp.source == "html" and inp.url:
-                future = executor.submit(fetch_text, inp.url, 8, 1)  # Reduced timeout/retries
+    # Separate URL-based inputs for parallel processing
+    url_inputs = []
+    inline_inputs = []
+    
+    for inp in inputs:
+        if inp.url and inp.source in ["html", "csv", "json"]:
+            url_inputs.append(inp)
+        else:
+            inline_inputs.append(inp)
+    
+    # Process inline inputs immediately
+    for inp in inline_inputs:
+        _load_single_input(inp, tables, logs)
+    
+    # Process URL inputs in parallel (if any)
+    if url_inputs:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_input = {}
+            
+            for inp in url_inputs:
+                if inp.source == "html":
+                    future = executor.submit(fetch_text, inp.url, 8, 1)
+                elif inp.source == "csv":
+                    future = executor.submit(fetch_text, inp.url, 8, 1)
+                elif inp.source == "json":
+                    future = executor.submit(fetch_json, inp.url, 8)
+                else:
+                    continue
                 future_to_input[future] = inp
-            elif inp.source == "csv" and inp.url:
-                future = executor.submit(fetch_text, inp.url, 8, 1)
-                future_to_input[future] = inp
-            elif inp.source == "json" and inp.url:
-                future = executor.submit(fetch_json, inp.url, 8)
-                future_to_input[future] = inp
-            else:
-                # Handle non-URL inputs immediately
-                _load_single_input(inp, tables, logs)
-        
-        # Process completed futures
-        for future in as_completed(future_to_input, timeout=15):  # Global timeout
-            inp = future_to_input[future]
-            try:
-                data = future.result()
-                _process_fetched_data(inp, data, tables, logs)
-            except Exception as e:
-                logs.append(f"[inputs] {inp.name}: fetch error {e}")
+            
+            # Process results
+            for future in as_completed(future_to_input, timeout=15):
+                inp = future_to_input[future]
+                try:
+                    data = future.result()
+                    _process_fetched_data(inp, data, tables, logs)
+                except Exception as e:
+                    logs.append(f"[inputs] {inp.name}: fetch error {e}")
     
     return tables
+
+def debug_attachment_flow(attachment_tables: Dict[str, Any], logs: List[str]):
+    """Helper function to debug attachment data flow"""
+    logs.append(f"[DEBUG] attachment_tables keys: {list(attachment_tables.keys())}")
+    for k, v in attachment_tables.items():
+        if hasattr(v, 'shape'):
+            logs.append(f"[DEBUG] {k}: DataFrame shape={v.shape}, columns={list(v.columns) if hasattr(v, 'columns') else 'no columns'}")
+        else:
+            logs.append(f"[DEBUG] {k}: type={type(v)}")
 
 def _load_single_input(inp: AnalysisInput, tables: Dict[str, Any], logs: List[str]):
     import pandas as pd
     
-    if inp.source == "csv" and isinstance(inp.data, str):
-        from io import StringIO
-        tables[inp.name] = pd.read_csv(StringIO(inp.data))
-        logs.append(f"[inputs] {inp.name}: inline csv shape={tables[inp.name].shape}")
-    elif inp.source == "json" and inp.data:
-        tables[inp.name] = pd.json_normalize(inp.data)
-        logs.append(f"[inputs] {inp.name}: inline json shape={tables[inp.name].shape}")
-    elif inp.source == "inline":
-        tables[inp.name] = pd.DataFrame(inp.data or [])
-        logs.append(f"[inputs] {inp.name}: inline records shape={tables[inp.name].shape}")
+    try:
+        if inp.source == "csv" and isinstance(inp.data, str):
+            from io import StringIO
+            tables[inp.name] = pd.read_csv(StringIO(inp.data))
+            logs.append(f"[inputs] {inp.name}: inline csv shape={tables[inp.name].shape}")
+        elif inp.source == "json" and inp.data:
+            if isinstance(inp.data, list):
+                # List of records
+                tables[inp.name] = pd.DataFrame(inp.data)
+            else:
+                # Nested JSON - normalize it
+                tables[inp.name] = pd.json_normalize(inp.data)
+            logs.append(f"[inputs] {inp.name}: inline json shape={tables[inp.name].shape}")
+        elif inp.source == "inline":
+            # Handle inline data properly - could be CSV text or records
+            if isinstance(inp.data, str):
+                # Check if it's CSV text (starts with column names and has delimiters)
+                data_str = inp.data
+                # Remove any [TEXT] prefix that might be added
+                if data_str.startswith("[TEXT] "):
+                    data_str = data_str[7:]
+                
+                # Try to parse as CSV if it looks like CSV
+                lines = data_str.strip().splitlines()
+                if len(lines) >= 2 and (',' in data_str or '\t' in data_str):
+                    try:
+                        from io import StringIO
+                        # Determine separator
+                        if data_str.count('\t') > data_str.count(','):
+                            df = pd.read_csv(StringIO(data_str), sep='\t')
+                        else:
+                            df = pd.read_csv(StringIO(data_str), sep=',')
+                        tables[inp.name] = df
+                        logs.append(f"[inputs] {inp.name}: parsed CSV text shape={tables[inp.name].shape}")
+                    except Exception as e:
+                        logs.append(f"[inputs] {inp.name}: failed to parse as CSV: {e}")
+                        tables[inp.name] = pd.DataFrame()
+                else:
+                    # Not CSV, treat as empty
+                    tables[inp.name] = pd.DataFrame()
+                    logs.append(f"[inputs] {inp.name}: text data not CSV format")
+            elif isinstance(inp.data, list) and len(inp.data) > 0:
+                tables[inp.name] = pd.DataFrame(inp.data)
+                logs.append(f"[inputs] {inp.name}: inline records shape={tables[inp.name].shape}")
+            else:
+                # Create empty DataFrame if no data
+                tables[inp.name] = pd.DataFrame()
+                logs.append(f"[inputs] {inp.name}: no valid data, created empty DataFrame")
+        else:
+            logs.append(f"[inputs] {inp.name}: unsupported source {inp.source}")
+            tables[inp.name] = pd.DataFrame()
+    except Exception as e:
+        logs.append(f"[inputs] {inp.name}: error loading - {e}")
+        tables[inp.name] = pd.DataFrame()  # Fallback empty DataFrame
 
 def _process_fetched_data(inp: AnalysisInput, data: Any, tables: Dict[str, Any], logs: List[str]):
     import pandas as pd
@@ -1095,103 +1210,159 @@ def make_fresh_spec_from_attachments(question: str, previews: List[AttachmentPre
 def run_analysis_spec(spec: AnalysisSpec, attachment_tables: Dict[str, Any]) -> Dict[str, Any]:
     logs: List[str] = []
 
-    # Load inputs (with parallel fetching)
-    tables = load_inputs(spec.inputs, logs)
-
-    # Inject attachments by table_name
+    # CRITICAL FIX: Inject attachments FIRST, then load inputs
+    tables = {}
+    
+    # Start with attachment tables (full data)
     for k, v in attachment_tables.items():
-        tables[k] = v  # overwrite inline stub with full data
-        logs.append(f"[inputs] attachment injected (overwrote/added): {k} shape={getattr(v,'shape',None)}")
+        tables[k] = v.copy() if hasattr(v, 'copy') else v  # Make a copy to avoid modifying original
+        logs.append(f"[inputs] attachment loaded: {k} shape={getattr(v,'shape','unknown')}")
 
-    # Transforms
-    for t in spec.transforms[:10]:
+    # Then load additional inputs from spec
+    spec_tables = load_inputs(spec.inputs, logs)
+    
+    # Merge spec tables, but don't overwrite attachments unless explicitly intended
+    for k, v in spec_tables.items():
+        if k not in tables:  # Only add if not already present from attachments
+            tables[k] = v
+            logs.append(f"[inputs] spec input added: {k} shape={getattr(v,'shape','unknown')}")
+        else:
+            logs.append(f"[inputs] skipped spec input {k} - attachment data takes precedence")
+
+    if not tables:
+        logs.append("[inputs] WARNING: No tables loaded!")
+        return {
+            "answer": "No data tables found",
+            "tables": {},
+            "images": {},
+            "metrics": {},
+            "logs": logs,
+        }
+
+    # Apply transforms
+    for i, t in enumerate(spec.transforms[:10]):
+        logs.append(f"[transform] {i+1}: {t.op} on {t.target}")
         apply_transform(tables, t, logs)
 
-    # Charts (now keyed)
+    # Generate charts
     images_by_key = render_charts(tables, spec.charts, logs)
 
-    # Metrics (now computed!)
+    # Compute metrics
     metrics = compute_metrics(tables, spec.metrics, logs)
 
-    # Pick a result table
+    # Pick result table
     res_name = spec.result_table if spec.result_table in tables else (next(iter(tables.keys())) if tables else "result")
+    
+    if res_name not in tables:
+        logs.append(f"[result] WARNING: result_table '{res_name}' not found, using first available")
+        res_name = next(iter(tables.keys())) if tables else "empty"
+        if res_name == "empty":
+            tables["empty"] = pd.DataFrame()
 
-    # Small previews only
+    # Create output tables (preview only)
     tables_out: Dict[str, List[Dict[str, Any]]] = {}
     for name, df in tables.items():
         try:
-            tables_out[name] = df_to_records(df.head(50))
-        except Exception:
+            # Limit output size but ensure we have the result table
+            preview_size = 100 if name == res_name else 50
+            tables_out[name] = df_to_records(df.head(preview_size))
+            logs.append(f"[output] table {name}: {len(tables_out[name])} rows in output")
+        except Exception as e:
+            logs.append(f"[output] error converting table {name}: {e}")
             tables_out[name] = []
 
-    # Optional built-in answer
+    # Generate answer
     ans = summarize(spec.answer, tables, logs)
 
     return {
         "answer": ans,
-        "tables": {res_name: tables_out.get(res_name, [])},
-        "images": images_by_key,   # dict[str -> data URI]
-        "metrics": metrics,        # dict[str -> scalar or str]
+        "tables": {res_name: tables_out.get(res_name, [])} if res_name in tables_out else tables_out,
+        "images": images_by_key,
+        "metrics": metrics,
         "logs": logs,
     }
 # ---- Parallel API execution with 2 debug tries + fresh fallback -------------
-async def analyze_question_async(question: str,
-                                 previews: List[AttachmentPreview],
-                                 attachment_tables: Dict[str, Any],
-                                 requested_format: Optional[str],
-                                 debug: int = 0):
-
+async def analyze_question_async_fixed(question: str,
+                                      previews: List[AttachmentPreview],
+                                      attachment_tables: Dict[str, Any],
+                                      requested_format: Optional[str],
+                                      debug: int = 0):
+    
     attachments_summary = attachments_summary_for_llm(previews)
     last_err: Optional[str] = None
-
-    # Attempt 1: normal
-    for attempt in range(1, 4):  # 1=normal, 2=debug try 1, 3=debug try 2
-        debug_hint = None if attempt == 1 else f"Previous error: {last_err}. Prefer using the provided attachments via inline inputs. Avoid network fetches."
+    
+    # Debug logging
+    debug_logs = []
+    if debug:
+        debug_logs.append(f"Question: {question[:200]}...")
+        debug_logs.append(f"Attachments summary: {attachments_summary}")
+        debug_logs.append(f"Attachment tables: {list(attachment_tables.keys())}")
+        for k, v in attachment_tables.items():
+            if hasattr(v, 'shape'):
+                debug_logs.append(f"  {k}: shape={v.shape}")
+    
+    # Attempt normal processing with debug info
+    for attempt in range(1, 4):
+        debug_hint = None if attempt == 1 else f"Previous error: {last_err}. Use attachment tables: {list(attachment_tables.keys())}"
+        
         try:
-            # Step 1: Plan (fast)
-            # Replace the conditional with this:
-            print(question)
-            print(attachments_summary)
-            plan = plan_question(f"{question}\n\n(You have attachments. See list below.)\n{attachments_summary}")
-
-            # Step 2: Generate spec (single attempt)
+            # Step 1: Plan
+            plan = plan_question(f"{question}\n\nAvailable attachments:\n{attachments_summary}")
+            if debug:
+                debug_logs.append(f"Plan generated: {plan.dict()}")
+            
+            # Step 2: Generate spec
             spec = generate_analysis_spec(plan, attachments_summary, debug_hint=debug_hint)
-            # Step 3: Execute spec
+            if debug:
+                debug_logs.append(f"Spec generated: {spec.dict()}")
+            
+            # Step 3: Execute with proper attachment data
+            if debug:
+                debug_logs.append(f"About to execute with attachments: {list(attachment_tables.keys())}")
+            
             final_structured = run_analysis_spec(spec, attachment_tables)
-            print(final_structured)
             final_structured = validate_final_result(final_structured)
+            
+            if debug:
+                debug_logs.append(f"Execution completed. Tables in result: {list(final_structured.get('tables', {}).keys())}")
+            
+            # Format output
             structured_for_llm = strip_payload_for_llm(final_structured)
             fmt_prompt = make_formatter_prompt(question, structured_for_llm, requested_format)
             formatted = llm_call_raw(OUTPUT_FORMATTER_SYSTEM, fmt_prompt, FORMATTER_MODEL, temperature=0, max_tokens=500)
-            print(formatted)
+            
             if debug == 1:
                 return JSONResponse({
                     "ok": True,
                     "formatted_output": formatted,
                     "internal_final_result": final_structured,
                     "debug": {
-                        "plan": plan.model_dump(),
-                        "analysis_spec": spec.model_dump(),
+                        "plan": plan.dict(),
+                        "analysis_spec": spec.dict(),
                         "attempt": attempt,
-                        "performance_mode": "speed_optimized",
-                        "attachments": [p.model_dump() for p in previews]
+                        "debug_logs": debug_logs,
+                        "attachments": [p.dict() for p in previews]
                     }
                 })
-            formatted = inject_images(formatted, final_structured.get("images"))
+            
+            formatted = inject_images(formatted, final_structured.get("images", {}))
             return Response(formatted, media_type="text/plain")
+            
         except Exception as e:
             last_err = str(e)
-
-    # Fresh fallback (programmatic minimal spec)
+            if debug:
+                debug_logs.append(f"Attempt {attempt} failed: {e}")
+    
+    # Fallback handling
     try:
         spec = make_fresh_spec_from_attachments(question, previews)
         final_structured = run_analysis_spec(spec, attachment_tables)
-        print(final_structured)
         final_structured = validate_final_result(final_structured)
+        
         structured_for_llm = strip_payload_for_llm(final_structured)
         fmt_prompt = make_formatter_prompt(question, structured_for_llm, requested_format)
         formatted = llm_call_raw(OUTPUT_FORMATTER_SYSTEM, fmt_prompt, FORMATTER_MODEL, temperature=0, max_tokens=500)
-        print(formatted)
+        
         if debug == 1:
             return JSONResponse({
                 "ok": True,
@@ -1199,18 +1370,19 @@ async def analyze_question_async(question: str,
                 "internal_final_result": final_structured,
                 "debug": {
                     "plan": "(fresh-fallback)",
-                    "analysis_spec": spec.model_dump(),
+                    "analysis_spec": spec.dict(),
                     "attempt": "fresh_fallback",
                     "previous_error": last_err,
-                    "attachments": [p.model_dump() for p in previews]
+                    "debug_logs": debug_logs,
+                    "attachments": [p.dict() for p in previews]
                 }
             })
-        formatted = inject_images(formatted, final_structured.get("images"))
+        
+        formatted = inject_images(formatted, final_structured.get("images", {}))
         return Response(formatted, media_type="text/plain")
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"All attempts failed. Last error: {last_err} | Fresh fallback error: {e}")
-
-from fastapi import FastAPI, Request, UploadFile, HTTPException
+        raise HTTPException(status_code=500, detail=f"All attempts failed. Last error: {last_err} | Fresh fallback error: {e} | Debug logs: {debug_logs}")
 
 @app.post("/api/")
 async def analyze_question(
@@ -1249,7 +1421,7 @@ async def analyze_question(
         raise HTTPException(status_code=400, detail="Could not detect a question file.")
 
     requested_format = detect_requested_format(question_text)
-    return await analyze_question_async(
+    return await analyze_question_async_fixed(
     question_text, previews, attachment_tables, requested_format, debug
 )  
 @app.get("/health")
