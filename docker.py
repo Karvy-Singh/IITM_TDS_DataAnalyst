@@ -28,9 +28,9 @@ LLM_API_KEY = os.getenv("OPENAI_API_KEY")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
 
 # Defaults tuned for small models; override via env
-PLANNER_MODEL    = os.getenv("LLM_PLANNER_MODEL",    "gpt-4o-mini")
-CODER_MODEL      = os.getenv("LLM_CODER_MODEL",      "gpt-4o-mini")
-FORMATTER_MODEL  = os.getenv("LLM_FORMATTER_MODEL",  "gpt-4o-mini")
+PLANNER_MODEL    = os.getenv("LLM_PLANNER_MODEL",    "gpt-5-mini")
+CODER_MODEL      = os.getenv("LLM_CODER_MODEL",      "gpt-5-mini")
+FORMATTER_MODEL  = os.getenv("LLM_FORMATTER_MODEL",  "gpt-5-mini")
 
 if not LLM_API_KEY:
     # /health and / will work; /api will return a clear error.
@@ -181,6 +181,7 @@ Your task is to produce the final result in the exact format requested by the us
 Rules:
 - Read the user request carefully and identify any explicit or implicit output format or schema, no matter what it is called or how it is described.
 - Follow that format or schema exactly, including structure, syntax, spacing, and punctuation.
+-Use ONLY the values already present in Data.metrics (scalars) and Data.images (data URIs).
 - If the user describes the format in words, deduce and apply it precisely.
 - Do not add extra explanations, headers, or commentary outside the requested format.
 - If no format is specified at all, default to concise plain text.
@@ -391,22 +392,34 @@ def plan_question(question: str) -> Plan:
         return Plan(**data2)
 
 # ---- Speed-optimized spec generation ----------------------------------------
-def make_coder_prompt(plan: Plan, attachments_summary: str, debug_hint: Optional[str]=None) -> str:
+def make_coder_prompt(plan: Plan, attachments_summary: str, attachments_present: bool, debug_hint: Optional[str]=None) -> str:
     hint = f"\nDEBUG_HINT: {debug_hint}" if debug_hint else ""
+
+    if attachments_present:
+        attach_guidance = (
+            "When referencing attachments, set inputs[].source='inline' and inputs[].data to a SMALL sample "
+            "(we will provide full data at execution time)."
+        )
+    else:
+        attach_guidance = (
+            "No attachments are available. Do NOT fabricate inline samples. "
+            "If data must be fetched, create URL-based inputs with source='html'|'csv'|'json' and a real url. "
+            "If nothing is fetchable, set answer.type='none'."
+        )
     return (
-        f"Question: {plan.question}\n"
-        f"Plan: {plan.json()}\n"
-        f"Attachments available (prefer using them with source='inline' and their table names):\n{attachments_summary}\n"
-        "When referencing attachments, set inputs[].source='inline' and inputs[].data to a SMALL sample (we will provide full data at execution time)."
-        f"{hint}\n"
-        "Return analysis_spec JSON. Be minimal and efficient."
-    )
+         f"Question: {plan.question}\n"
+         f"Plan: {plan.json()}\n"
+         f"Attachments available (prefer using them with source='inline' and their table names):\n{attachments_summary}\n"
+         f"{attach_guidance}"
+         f"{hint}\n"
+         "Return analysis_spec JSON. Be minimal and efficient."
+     )
 
 # Single-shot spec generation (no best-of-N for speed)
-def generate_analysis_spec(plan: Plan, attachments_summary: str, debug_hint: Optional[str]=None) -> AnalysisSpec:
+def generate_analysis_spec(plan: Plan, attachments_summary: str, attachments_present: bool, debug_hint: Optional[str]=None) -> AnalysisSpec:
     raw = llm_call_raw(
         CODER_SYSTEM,
-        make_coder_prompt(plan, attachments_summary, debug_hint),
+        make_coder_prompt(plan, attachments_summary, attachments_present,debug_hint),
         CODER_MODEL,
         temperature=0,
         max_tokens=800
@@ -496,8 +509,16 @@ def sniff_bytes(b: bytes, content_type: Optional[str] = None, filename: str = ""
     return mt, ext
 
 def decode_text(b: bytes) -> str:
-    best = from_bytes(b).best()
-    return (best.output() if best else b.decode("utf-8", "ignore"))
+    try:
+        # Try simple UTF-8 first
+        simple = b.decode("utf-8")
+        print(f"[DEBUG] UTF-8 decode: {simple[:1000]}...")
+        return simple
+    except:
+        best = from_bytes(b).best()
+        result = (best.output() if best else b.decode("utf-8", "ignore"))
+        print(f"[DEBUG] Charset-normalizer result: {result[:1000]}...")
+        return result
 
 
 def read_any(name: str, data: bytes, content_type: Optional[str]):
@@ -743,6 +764,34 @@ def build_attachment_previews(files: List[UploadFile]) -> Tuple[Optional[str], L
                 columns=list(df.columns)[:50] if hasattr(df, "columns") else None
             ))
             continue
+        if kind != "table":
+            name_l = (name or "").lower()
+            looks_csvish = False
+            try:
+                head_text = decode_text(b[:4096] if isinstance(b, (bytes, bytearray)) else b)
+                if head_text:
+                    first_line = head_text.splitlines()[0] if head_text.splitlines() else ""
+                    looks_csvish = ("," in first_line or "\t" in first_line) and (
+                        len(first_line.split(",")) + len(first_line.split("\t")) > 1
+                    )
+            except Exception:
+                pass
+            if name_l.endswith((".csv", ".tsv")) or looks_csvish:
+                try:
+                    import pandas as pd, io as _io
+                    txt = decode_text(b)
+                    sep = "\t" if name_l.endswith(".tsv") or (txt.count("\t") > txt.count(",")) else ","
+                    df = pd.read_csv(_io.StringIO(txt.lstrip("\ufeff")), sep=sep)
+                    table_name = _sanitize_name(name)
+                    attachment_tables[table_name] = df
+                    previews.append(AttachmentPreview(
+                        name=name, table_name=table_name, kind="tabular",
+                        sample_text=None, sample_records=df_to_records(df.head(50)),
+                        shape=df.shape, columns=list(df.columns)[:50]
+                    ))
+                    continue
+                except Exception:
+                    pass
 
         # Handle other file types (HTML, text, images, etc.)
         if kind == "html":
@@ -1000,7 +1049,13 @@ def apply_transform(df_map: Dict[str, Any], t: Transform, logs: List[str]) -> No
             df_map[t.target] = df.query(q)
         elif t.op == "groupby_agg":
             by = t.args.get("by", [])
-            aggs = t.args.get("aggs", {})
+            # accept string or list
+            if isinstance(by, str):
+                by = [by]
+            # accept 'aggs' or 'agg'
+            aggs = t.args.get("aggs", t.args.get("agg", {}))
+            if not isinstance(aggs, dict) or not by:
+                raise ValueError("groupby_agg requires by (str|list) and agg(s) dict")
             df_map[t.target] = df.groupby(by, dropna=False).agg(aggs).reset_index()
         elif t.op == "join":
             right = t.args.get("right")
@@ -1304,6 +1359,7 @@ async def analyze_question_async_fixed(question: str,
                                       debug: int = 0):
     
     attachments_summary = attachments_summary_for_llm(previews)
+    attachments_present = bool(attachment_tables) or any(p.kind == "tabular" for p in previews)
     last_err: Optional[str] = None
     
     # Debug logging
@@ -1327,7 +1383,7 @@ async def analyze_question_async_fixed(question: str,
                 debug_logs.append(f"Plan generated: {plan.dict()}")
             
             # Step 2: Generate spec
-            spec = generate_analysis_spec(plan, attachments_summary, debug_hint=debug_hint)
+            spec = generate_analysis_spec(plan, attachments_summary,attachments_present, debug_hint=debug_hint)
             if debug:
                 debug_logs.append(f"Spec generated: {spec.dict()}")
             
